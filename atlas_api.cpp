@@ -6,7 +6,6 @@
 #include <cmath>
 #include <vector>
 #include <malloc.h>
-#include <omp.h>
 #include <io.h>
 
 #ifdef _WIN32
@@ -210,6 +209,9 @@ ATLAS_API void atlas_matmul_f32(int rows, int packed_cols, const uint8_t* data,
                                  int n_tokens, float scale) {
     const int as = packed_cols * 5;
 
+    #ifdef _OPENMP
+    #pragma omp parallel for
+    #endif
     for (int r = 0; r < rows; r++) {
         const uint8_t* rd = data + r * packed_cols;
         for (int t = 0; t < n_tokens; t++) {

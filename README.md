@@ -114,16 +114,15 @@ After all three fixes, all layer-0 TQ1 projections match the HuggingFace referen
 | `atlas_infer.py` | End-to-end inference engine (Python) |
 | `atlas_api.cpp` | C-exported DLL (load, matmul, norm, rope) |
 | `atlas_kernel.hpp` | Header-only LUT + matmul kernels |
-| `atlas.dll` | Prebuilt DLL (Clang LLVM-MinGW) |
+| `atlas.dll` | Prebuilt DLL (Clang LLVM-MinGW, 80 KB) |
 | `compile.bat` | DLL build script |
-| `test_direct_cmp.py` | Atlas file vs HF ternary values (no model load) |
+| `test_direct_cmp.py` | Atlas file vs HF ternary values (`python test_direct_cmp.py model.atlas model.safetensors`) |
 | `test_kernel_row.py` | Single-row kernel vs pure Python |
 | `test_row_order.py` | Row reordering demonstration (corr 0.006 vs 0.999) |
-| `diagnose_calibrate.py` | Layer-0 kernel injection with per-row scale comparison |
 
 ## License
 
-This project is provided for research and educational purposes. The TQ1.0 format and inference engine are original work. BitNet b1.58 is from Microsoft Research. Falcon3 is from Technology Innovation Institute. Refer to each project's license for model weights and original code.
+This project's code (TQ1.0 format, packer, inference engine, kernels) is Apache 2.0. BitNet b1.58 is from Microsoft Research. Falcon3 models are from Technology Innovation Institute (TII) and subject to the [TII Falcon License 1.0](https://falconllm.tii.ae/). Users must accept TII's license to download and use Falcon3 weights.
 
 ## Citation
 

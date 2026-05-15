@@ -32,3 +32,10 @@ test_unpack_verify.py
 validate_kernel.py
 verify_fix.py
 atlas_bench.cpp
+diagnose_calibrate.py
+save_ref_activations.py
+libc++.dll
+libomp.dll
+libunwind.dll
+diagnose_calibrate.py
+save_ref_activations.py
