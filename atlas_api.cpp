@@ -7,6 +7,7 @@
 #include <vector>
 #include <malloc.h>
 #include <io.h>
+#include <immintrin.h>
 
 #ifdef _WIN32
   #define FSEEK _fseeki64
@@ -161,6 +162,70 @@ ATLAS_API void atlas_get_info(AtlasModel* m, int* n_layers, int* hidden_dim,
     if (vocab_size) *vocab_size = m->vocab_size;
 }
 
+// ─── Decompress all TQ1 tensors to int8 in-place ──────────────────────
+// Frees packed data after decompression. Call after Python closes safetensors.
+ATLAS_API void atlas_decompress_all(AtlasModel* m) {
+    int total = 0;
+    for (auto& t : m->tensors) {
+        if (t.ttype != 0) continue;
+        total++;
+
+        int input_dim = t.packed_cols * 5;
+        int n_vals = t.row_dim * input_dim;
+
+        // Allocate: [scale_fp16(2)] [i8_data(rows × input_dim)] [row_sums(rows × 4)]
+        uint8_t* new_data = new uint8_t[2 + n_vals + t.row_dim * 4];
+        new_data[0] = t.data[0];
+        new_data[1] = t.data[1];
+
+        int8_t* i8 = (int8_t*)(new_data + 2);
+        int32_t* rs = (int32_t*)(i8 + n_vals);
+        const uint8_t* packed = t.data + 2;
+
+        for (int r = 0; r < t.row_dim; r++) {
+            int sum = 0;
+            int pos = 0;
+            for (int c = 0; c < t.packed_cols; c++) {
+                uint8_t b = packed[r * t.packed_cols + c];
+                int v = (b % 3) - 1; b /= 3; i8[r * input_dim + pos++] = (int8_t)v; sum += v;
+                v = (b % 3) - 1; b /= 3; i8[r * input_dim + pos++] = (int8_t)v; sum += v;
+                v = (b % 3) - 1; b /= 3; i8[r * input_dim + pos++] = (int8_t)v; sum += v;
+                v = (b % 3) - 1; b /= 3; i8[r * input_dim + pos++] = (int8_t)v; sum += v;
+                v = (b % 3) - 1;        i8[r * input_dim + pos++] = (int8_t)v; sum += v;
+            }
+            rs[r] = sum;
+        }
+
+        // Free packed data, replace with int8
+        delete[] t.data;
+        t.data = new_data;
+        t.data_size = 2 + n_vals + t.row_dim * 4;
+        t.ttype = 3;  // int8-decoded
+    }
+    printf("[ATLAS] Decompressed %d TQ1 tensors to int8\n", total);
+}
+
+// ─── Get int8-decoded tensor from C++ side ─────────────────────────────
+// Returns i8 data pointer or nullptr if not decoded
+ATLAS_API const int8_t* atlas_get_int8(AtlasModel* m, int idx, int* rows,
+                                        int* input_dim, float* scale,
+                                        const int32_t** row_sums) {
+    if (idx < 0 || idx >= (int)m->tensors.size()) return nullptr;
+    auto& t = m->tensors[idx];
+    if (t.ttype != 3) return nullptr;
+
+    uint16_t scale_raw;
+    memcpy(&scale_raw, t.data, 2);
+    if (scale) *scale = fp16_to_fp32(scale_raw);
+    if (rows) *rows = t.row_dim;
+    if (input_dim) *input_dim = t.packed_cols * 5;
+    if (row_sums) {
+        int n_vals = t.row_dim * t.packed_cols * 5;
+        *row_sums = (const int32_t*)(t.data + 2 + n_vals);
+    }
+    return (const int8_t*)(t.data + 2);
+}
+
 // ─── Get tensor info ────────────────────────────────────────────────────
 ATLAS_API void atlas_tensor_info(AtlasModel* m, int idx, int* ttype,
                                   int* row_dim, int* col_dim) {
@@ -258,6 +323,65 @@ ATLAS_API void atlas_tensor_matmul(AtlasModel* m, int idx,
 
     atlas_matmul_f32(t.row_dim, t.packed_cols, t.data + 2,
                      activations, output, n_tokens, scale);
+}
+
+// ─── Matmul: int8 weights × int8 activations → float32 output ──────────
+// Uses _mm256_maddubs_epi16 with offset trick:
+//   act_int8 ∈ [-127, 127],  act_u8 = act_int8 + 128 ∈ [1, 255]
+//   w_int8 ∈ {-1, 0, 1}
+//   sum(act_i * w_i) = sum((act_u8 - 128) * w_i)
+//                    = sum(act_u8 * w_i) - 128 * row_sum
+//   where _mm256_maddubs_epi16(act_u8, w_i8) computes sum(act_u8 * w_i)
+//
+// activations: [n_tokens × input_dim] int8 (IN THE RANGE [-127, 127])
+// output:      [n_tokens × rows] float32
+// row_sums:    [rows] int32 — precomputed Σ w_i per output row
+ATLAS_API void atlas_matmul_i8_f32(int rows, int input_dim,
+                                    const int8_t* weights, const uint8_t* act_u8,
+                                    const int32_t* row_sums, float* output,
+                                    int n_tokens) {
+    #ifdef _OPENMP
+    #pragma omp parallel for
+    #endif
+    for (int r = 0; r < rows; r++) {
+        const int8_t* w = weights + r * input_dim;
+        int sum_w = row_sums[r];
+
+        for (int t = 0; t < n_tokens; t++) {
+            const uint8_t* a = act_u8 + t * input_dim;
+
+            int c = 0;
+            int dot = 0;
+
+            // AVX2: 32 bytes per iteration → 16 pairs via maddubs → 8 int32 via madd
+            __m256i acc = _mm256_setzero_si256();
+
+            for (; c + 32 <= input_dim; c += 32) {
+                __m256i au = _mm256_loadu_si256((const __m256i*)(a + c));
+                __m256i wi = _mm256_loadu_si256((const __m256i*)(w + c));
+                __m256i prod16 = _mm256_maddubs_epi16(au, wi);
+                __m256i prod32 = _mm256_madd_epi16(prod16, _mm256_set1_epi16(1));
+                acc = _mm256_add_epi32(acc, prod32);
+            }
+
+            // Horizontal sum of acc
+            __m128i lo = _mm256_castsi256_si128(acc);
+            __m128i hi = _mm256_extracti128_si256(acc, 1);
+            __m128i sum128 = _mm_add_epi32(lo, hi);
+            sum128 = _mm_hadd_epi32(sum128, sum128);
+            sum128 = _mm_hadd_epi32(sum128, sum128);
+            dot = _mm_cvtsi128_si32(sum128);
+
+            // Tail (less than 32 elements)
+            for (; c < input_dim; c++) {
+                dot += (int)a[c] * (int)w[c];
+            }
+
+            // Undo 128 offset: dot' = dot - 128 * Σ w_i
+            int result = dot - 128 * sum_w;
+            output[t * rows + r] = (float)result;
+        }
+    }
 }
 
 // ─── Norm: float16 tensor → RMSNorm ────────────────────────────────────

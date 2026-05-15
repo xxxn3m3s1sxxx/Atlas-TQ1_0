@@ -40,6 +40,21 @@ dll.atlas_matmul_f32.argtypes = [ctypes.c_int, ctypes.c_int,
     ctypes.POINTER(ctypes.c_uint8), ctypes.POINTER(ctypes.c_float),
     ctypes.POINTER(ctypes.c_float), ctypes.c_int, ctypes.c_float]
 
+dll.atlas_matmul_i8_f32.restype = None
+dll.atlas_matmul_i8_f32.argtypes = [ctypes.c_int, ctypes.c_int,
+    ctypes.POINTER(ctypes.c_int8), ctypes.POINTER(ctypes.c_uint8),
+    ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_float),
+    ctypes.c_int]
+
+dll.atlas_decompress_all.restype = None
+dll.atlas_decompress_all.argtypes = [ctypes.c_void_p]
+
+dll.atlas_get_int8.restype = ctypes.POINTER(ctypes.c_int8)
+dll.atlas_get_int8.argtypes = [ctypes.c_void_p, ctypes.c_int,
+    ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+    ctypes.POINTER(ctypes.c_float),
+    ctypes.POINTER(ctypes.POINTER(ctypes.c_int32))]
+
 dll.atlas_rmsnorm_f32.restype = None
 dll.atlas_rmsnorm_f32.argtypes = [ctypes.POINTER(ctypes.c_float),
     ctypes.POINTER(ctypes.c_uint8), ctypes.POINTER(ctypes.c_float),
@@ -99,6 +114,10 @@ class AtlasModel:
         # Cache tensor indices for fast lookup
         self._cache_indices()
 
+        # Decompress all TQ1 tensors to int8 in C++ (frees packed data)
+        dll.atlas_decompress_all(self.model_ptr)
+        print("[Atlas] TQ1 tensors decoded to int8")
+
         # Precompute KV cache
         self.max_seq_len = 4096  # conservative for 16GB
         kvc_size = (self.n_layers, self.n_kv_heads, self.max_seq_len, self.head_dim)
@@ -119,6 +138,7 @@ class AtlasModel:
         self._norm_w = self._load_weight_f16("model.norm.weight")
         self._tq1_cache = {}
         self._f16_cache = {}
+        self._i8_cache = {}
 
     def _get_rope_theta(self):
         with open(self._atlas_path, 'rb') as f:
@@ -188,6 +208,69 @@ class AtlasModel:
         out = out.reshape(*orig_shape[:-1], rows)
         return out
 
+    def _load_int8(self, name):
+        """Load int8 data from C++ (decompressed at load time)."""
+        if name in self._i8_cache:
+            return self._i8_cache[name]
+        idx = self.idx.get(name)
+        if idx is None:
+            self._i8_cache[name] = (None, None, None, None, None)
+            return self._i8_cache[name]
+        rows = ctypes.c_int()
+        input_dim = ctypes.c_int()
+        scale = ctypes.c_float()
+        rs_ptr = ctypes.POINTER(ctypes.c_int32)()
+        i8_ptr = dll.atlas_get_int8(
+            self.model_ptr, idx, rows, input_dim, scale, rs_ptr)
+        if not i8_ptr:
+            self._i8_cache[name] = (None, None, None, None, None)
+            return self._i8_cache[name]
+        r, d = rows.value, input_dim.value
+        # Create numpy views into DLL memory (no copy)
+        i8 = np.ctypeslib.as_array(i8_ptr, shape=(r, d))
+        row_sums = np.ctypeslib.as_array(rs_ptr, shape=(r,))
+        result = (i8, r, d, scale.value, row_sums)
+        self._i8_cache[name] = result
+        return result
+
+    def _matmul_int8(self, i8_data, rows, input_dim, scale, row_sums, act):
+        """Int8 matmul via C++ AVX2 maddubs kernel."""
+        orig_shape = act.shape
+        act = act.reshape(-1, orig_shape[-1])
+
+        # Pad activation to packed_cols*5 (TQ1 packer pads to multiple of 5)
+        if act.shape[1] < input_dim:
+            pad = np.zeros((act.shape[0], input_dim), dtype=np.float32)
+            pad[:, :act.shape[1]] = act
+            act = pad
+
+        # Quantize activations to int8 [-127, 127]
+        max_abs = np.max(np.abs(act), axis=-1, keepdims=True)
+        max_abs = np.maximum(max_abs, 1e-5)
+        act_scale = 127.0 / max_abs
+        act_q = np.round(act * act_scale).astype(np.int8)
+
+        # Convert to uint8 with +128 offset (for maddubs unsigned operand)
+        act_u8 = (act_q.astype(np.int32) + 128).clip(0, 255).astype(np.uint8)
+
+        out = np.zeros((act.shape[0], rows), dtype=np.float32)
+        dll.atlas_matmul_i8_f32(
+            rows, input_dim,
+            i8_data.ctypes.data_as(ctypes.POINTER(ctypes.c_int8)),
+            act_u8.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            row_sums.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+            out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            act.shape[0])
+
+        # Reorder: atlas order → HF order
+        rows_packed = rows // 4
+        out = out.reshape(out.shape[0], rows_packed, 4).transpose(0, 2, 1).reshape(out.shape[0], rows)
+
+        # Dequantize
+        out *= max_abs / (127.0 * scale)
+        out = out.reshape(*orig_shape[:-1], rows)
+        return out
+
     def _matmul_f16(self, name, act):
         """Float32 activation × cached float32 weight (for non-TQ1 tensors like lm_head)."""
         if name not in self._f16_cache:
@@ -247,13 +330,13 @@ class AtlasModel:
         for b in range(B):
             x_norm[b] = self._rmsnorm(x[b], f"{prefix}.input_layernorm.weight")
 
-        # QKV projections
-        def _mt(name, act):
-            p, pc, r, s = self._load_tq1(name)
-            return self._matmul_tq1(p, pc, r, act, s)
-        q = _mt(f"{prefix}.self_attn.q_proj.weight", x_norm)
-        k = _mt(f"{prefix}.self_attn.k_proj.weight", x_norm)
-        v = _mt(f"{prefix}.self_attn.v_proj.weight", x_norm)
+        # QKV projections (int8)
+        def _mi(name, act):
+            d = self._load_int8(name)
+            return self._matmul_int8(*d, act) if d[0] is not None else None
+        q = _mi(f"{prefix}.self_attn.q_proj.weight", x_norm)
+        k = _mi(f"{prefix}.self_attn.k_proj.weight", x_norm)
+        v = _mi(f"{prefix}.self_attn.v_proj.weight", x_norm)
 
         # Fused RoPE + GQA attention + causal mask + softmax + weighted sum
         attn_out = np.zeros((B, self.hidden), dtype=np.float32)
@@ -272,9 +355,10 @@ class AtlasModel:
             ctypes.c_float(self.rope_theta),
             attn_out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)))
 
-        # Output projection
-        p, pc, r, s = self._load_tq1(f"{prefix}.self_attn.o_proj.weight")
-        attn_out = self._matmul_tq1(p, pc, r, attn_out, s)
+        # Output projection (int8)
+        o8 = self._load_int8(f"{prefix}.self_attn.o_proj.weight")
+        if o8[0] is not None:
+            attn_out = self._matmul_int8(*o8, attn_out)
         x = x + attn_out
 
         # Post-attention RMSNorm
@@ -282,15 +366,14 @@ class AtlasModel:
         for b in range(B):
             x_norm2[b] = self._rmsnorm(x[b], f"{prefix}.post_attention_layernorm.weight")
 
-        # FFN: SiLU(gate) * up → down
-        def _mt2(name, act):
-            p, pc, r, s = self._load_tq1(name)
-            return self._matmul_tq1(p, pc, r, act, s)
-        gate = _mt2(f"{prefix}.mlp.gate_proj.weight", x_norm2)
-        up = _mt2(f"{prefix}.mlp.up_proj.weight", x_norm2)
+        # FFN: SiLU(gate) * up → down (int8)
+        def _mi2(name, act):
+            d = self._load_int8(name)
+            return self._matmul_int8(*d, act) if d[0] is not None else None
+        gate = _mi2(f"{prefix}.mlp.gate_proj.weight", x_norm2)
+        up = _mi2(f"{prefix}.mlp.up_proj.weight", x_norm2)
         hidden = self._silu(gate) * up
-        p, pc, r, s = self._load_tq1(f"{prefix}.mlp.down_proj.weight")
-        down = self._matmul_tq1(p, pc, r, hidden, s)
+        down = _mi2(f"{prefix}.mlp.down_proj.weight", hidden)
         x = x + down
 
         return x
@@ -311,7 +394,35 @@ class AtlasModel:
         output_logits = self._matmul_f16("lm_head.weight", h_norm).reshape(B, seq_len, self.vocab_size)
         return output_logits
 
-    def generate(self, prompt, max_new_tokens=50, temperature=0.0):
+    @staticmethod
+    def _sample(logits, temperature=1.0, top_k=0, top_p=0.0):
+        """Sample next token from logits with temperature, top-k, top-p."""
+        if temperature == 0.0:
+            return int(np.argmax(logits))
+
+        probs = np.exp(logits / temperature)
+        probs /= probs.sum()
+
+        if top_k > 0:
+            idx = np.argpartition(probs, -top_k)[-top_k:]
+            mask = np.zeros_like(probs)
+            mask[idx] = 1.0
+            probs *= mask
+            probs /= probs.sum()
+
+        if top_p > 0.0:
+            idx = np.argsort(probs)[::-1]
+            cum = np.cumsum(probs[idx])
+            cutoff = np.searchsorted(cum, top_p, side='right') + 1
+            mask = np.zeros_like(probs)
+            mask[idx[:cutoff]] = 1.0
+            probs *= mask
+            probs /= probs.sum()
+
+        return int(np.random.choice(len(probs), p=probs))
+
+    def generate(self, prompt, max_new_tokens=50, temperature=1.0,
+                 top_k=40, top_p=0.9):
         try:
             tok = AutoTokenizer.from_pretrained(
                 os.path.dirname(self._safe_path),
@@ -329,22 +440,26 @@ class AtlasModel:
 
         full_logits = self.forward(input_ids[None])
         logits = full_logits[0, -1, :]
-        next_token = int(np.argmax(logits)) if temperature == 0.0 else int(np.random.choice(len(logits), p=np.exp(logits/temperature)/np.exp(logits/temperature).sum()))
 
-        output = [next_token]
-        for step in range(max_new_tokens - 1):
+        output = []
+        for step in range(max_new_tokens):
+            if step == 0:
+                current_logits = logits
+            else:
+                h = self._get_embedding(next_token)
+                for layer in range(self.n_layers):
+                    h = self.forward_layer(h, layer, [len(input_ids) + step - 1])
+                h_norm = self._rmsnorm(h.flatten(), "model.norm.weight")
+                current_logits = self._matmul_f16("lm_head.weight", h_norm.reshape(1, -1)).flatten()
+
+            next_token = self._sample(current_logits, temperature, top_k, top_p)
+            output.append(next_token)
+
             if eos_id is not None and next_token == eos_id:
                 break
             decoded = tok.decode(output, skip_special_tokens=False)
             if any(stop in decoded for stop in stop_tokens):
                 break
-            h = self._get_embedding(next_token)
-            for layer in range(self.n_layers):
-                h = self.forward_layer(h, layer, [len(input_ids) + step])
-            h_norm = self._rmsnorm(h.flatten(), "model.norm.weight")
-            logits = self._matmul_f16("lm_head.weight", h_norm.reshape(1, -1)).flatten()
-            next_token = int(np.argmax(logits)) if temperature == 0.0 else int(np.random.choice(len(logits), p=np.exp(logits/temperature)/np.exp(logits/temperature).sum()))
-            output.append(next_token)
 
         text = tok.decode(output, skip_special_tokens=True)
         for stop in stop_tokens:
