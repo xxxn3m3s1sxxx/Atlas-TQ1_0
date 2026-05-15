@@ -5,6 +5,9 @@ from safetensors import safe_open
 from transformers import AutoTokenizer
 
 # ─── Load C++ DLL ────────────────────────────────────────────────────────
+# Resolve OpenMP runtime conflicts (numpy MKL vs libomp)
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
 _dll_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "atlas.dll")
 if not os.path.exists(_dll_path):
     _dll_path = os.environ.get("ATLAS_DLL", _dll_path)

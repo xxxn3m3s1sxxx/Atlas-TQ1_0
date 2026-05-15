@@ -49,9 +49,11 @@ The inference script loads the atlas file into the C++ DLL, initializes the toke
 compile.bat
 ```
 
-Requires `clang++` (LLVM MinGW) in PATH. Builds `atlas.dll` with AVX2 and FMA.
+Requires `clang++` (LLVM MinGW) in PATH. Builds `atlas.dll` with AVX2+FMA and OpenMP.
 
-OpenMP note: the matmul kernel has `#pragma omp parallel for` gated by `#ifdef _OPENMP`. If your MinGW toolchain has a static `libomp.a`, add `-fopenmp` to `compile.bat` for multi-core row-level parallelism (~5-6x speedup on 8 cores). The default build omits it because LLVM-MinGW only ships `libomp.dll.a` (dynamic import library), which requires `libomp.dll` at runtime.
+OpenMP is enabled by default. `libomp.dll` must be discoverable at runtime — copy it from `llvm-mingw\x86_64-w64-mingw32\bin\libomp.dll` next to `atlas.dll`, or add that directory to `PATH`.
+
+**Windows-specific**: The MKL backend that numpy may use loads `libiomp5md.dll`, a different OpenMP runtime. This causes `OMP: Error #15` at import time. `atlas_infer.py` sets `KMP_DUPLICATE_LIB_OK=TRUE` automatically to suppress this. If you see the error despite this, set `KMP_DUPLICATE_LIB_OK=TRUE` in your environment before running.
 
 ## Architecture
 
@@ -69,18 +71,18 @@ safetensors ──► atlas_packer.py ──► .atlas file ──► atlas_infe
 
 4. **Python inference** (`atlas_infer.py`): Coordinates the full LlamaForCausalLM forward pass. Activation quantization (per-token int8 round-trip via max-abs scaling). GQA attention with KV cache. SiLU-gated FFN. Autoregressive loop with top-1 or temperature sampling. All heavy matmuls call into the DLL; norms, attention, and RoPE run in NumPy.
 
-The scalar matmul kernel has row-level parallelism via `#pragma omp parallel for` that activates when compiled with `-fopenmp`. The prebuilt DLL is single-threaded since the bundled LLVM-MinGW lacks a static `libomp.a`. See `compile.bat` for details.
+The matmul kernel uses OpenMP row-level parallelism. The prebuilt DLL is compiled with `-fopenmp` and achieves ~5× speedup on 8 cores versus single-threaded. The `libomp.dll` runtime must be available at load time.
 
 ## Performance
 
 Measured on i5-1235U (Alder Lake, 8 OMP threads, AVX2+FMA, 16 GB DDR4).
 
-| Model | Single Projection (down_proj) | Estimated Decode (full token) |
-|-------|------------------------------|-------------------------------|
- | Falcon3-7B (28L, 3072x23040) | 165 tok/s peak (kernel only) | ~2.2 s/tok (~0.45 tok/s) |
-| Falcon3-10B (40L, 3072x23040) | ~115 tok/s (estimated) | ~3.0 s/tok (~0.33 tok/s) |
+| Model | Single Projection (down_proj) | Full Decode |
+|-------|------------------------------|-------------|
+| Falcon3-7B (28L, 3072x23040) | ~120 tok/s (OMP, 8 threads) | ~0.7 s/tok (~1.4 tok/s) |
+| Falcon3-10B (40L, 3072x23040) | ~175 tok/s (OMP, 8 threads) | ~1.0 s/tok (~1.0 tok/s) |
 
-End-to-end decode is dominated by the sequential autoregressive loop (one token at a time through all layers). Prefill (prompt processing) is batch-parallel and significantly faster. The scalar LUT kernel is bandwidth-bound on packed weight reads; an AVX2 gather path was attempted but measured 4x slower due to gather latency on Alder Lake.
+Decode throughput improves ~3× with OpenMP (measured `down_proj`: 31ms → 5.8ms on 23040×614 packed matmul). Per-token time includes 7 TQ1 matmuls per layer × 40 layers plus Python overhead (attention einsum, RMSNorm, KV cache). Prefill (prompt processing) is batch-parallel and achieves similar per-token throughput. The scalar LUT kernel was chosen over AVX2 gather (4× slower on Alder Lake due to gather latency).
 
 ## Bugfix Chronology
 
