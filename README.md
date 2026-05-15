@@ -12,6 +12,7 @@ BitNet b1.58 models replace full-precision weights with ternary values (-1, 0, +
 |-------|-----------|-----------|--------|--------------|
 | Falcon3-7B-Instruct-1.58bit | 7B | 2.74 GB | 28 | LlamaForCausalLM + BitLinear |
 | Falcon3-10B-Instruct-1.58bit | 10B | 3.27 GB | 40 | LlamaForCausalLM + BitLinear |
+Both use `hidden_size=3072`, `intermediate_size=23040`, `head_dim=256`. The 10B packs more layers (40 vs 28).
 
 ## Quick Start
 
@@ -72,8 +73,8 @@ Measured on i5-1235U (Alder Lake, 8 OMP threads, AVX2+FMA, 16 GB DDR4).
 
 | Model | Single Projection (down_proj) | Estimated Decode (full token) |
 |-------|------------------------------|-------------------------------|
-| Falcon3-7B (28L, 3072x23040) | 165 tok/s peak (kernel only) | ~2-3 tok/s end-to-end |
-| Falcon3-10B (40L, 3840x28800) | ~120 tok/s (estimated) | ~3-4 tok/s end-to-end |
+ | Falcon3-7B (28L, 3072x23040) | 165 tok/s peak (kernel only) | ~2.2 s/tok (~0.45 tok/s) |
+| Falcon3-10B (40L, 3072x23040) | ~115 tok/s (estimated) | ~3.0 s/tok (~0.33 tok/s) |
 
 End-to-end decode is dominated by the sequential autoregressive loop (one token at a time through all layers). Prefill (prompt processing) is batch-parallel and significantly faster. The scalar LUT kernel is bandwidth-bound on packed weight reads; an AVX2 gather path was attempted but measured 4x slower due to gather latency on Alder Lake.
 
