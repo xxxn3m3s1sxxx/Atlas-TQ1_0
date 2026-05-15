@@ -45,12 +45,13 @@ dll.atlas_rmsnorm_f32.argtypes = [ctypes.POINTER(ctypes.c_float),
 dll.atlas_rope_f32.restype = None
 dll.atlas_rope_f32.argtypes = [ctypes.POINTER(ctypes.c_float),
     ctypes.POINTER(ctypes.c_float), ctypes.c_int, ctypes.c_int,
-    ctypes.c_int, ctypes.c_int]
+    ctypes.c_int, ctypes.c_int, ctypes.c_float]
 
 # ─── Model class ─────────────────────────────────────────────────────────
 class AtlasModel:
     def __init__(self, atlas_path, safetensors_path):
         self._safe_path = safetensors_path
+        self._atlas_path = atlas_path
         self.model_ptr = dll.atlas_load(atlas_path.encode())
         if not self.model_ptr:
             raise RuntimeError("Failed to load model")
@@ -63,6 +64,7 @@ class AtlasModel:
         self.n_layers, self.hidden, self.inter = nl.value, hd.value, id_.value
         self.n_heads, self.n_kv_heads, self.head_dim = nh.value, nk.value, hdm.value
         self.vocab_size = vs.value
+        self.rope_theta = self._get_rope_theta()
 
         # Build tensor name→index map from safetensors
         with safe_open(safetensors_path, framework='pt', device='cpu') as f:
@@ -82,8 +84,6 @@ class AtlasModel:
         self.k_cache = np.zeros(kvc_size, dtype=np.float16)
         self.v_cache = np.zeros(kvc_size, dtype=np.float16)
 
-        # Precompute RoPE frequencies
-        self._precompute_rope()
         # Warm LM head cache
         self._matmul_f16("lm_head.weight", np.random.randn(1, self.hidden).astype(np.float32))
 
@@ -99,13 +99,10 @@ class AtlasModel:
         self._tq1_cache = {}
         self._f16_cache = {}
 
-    def _precompute_rope(self):
-        self.rope_sin = np.zeros((self.max_seq_len, self.head_dim // 2), dtype=np.float32)
-        self.rope_cos = np.zeros((self.max_seq_len, self.head_dim // 2), dtype=np.float32)
-        theta = 10000.0 ** (-2.0 * np.arange(self.head_dim // 2) / self.head_dim)
-        for pos in range(self.max_seq_len):
-            self.rope_cos[pos] = np.cos(pos * theta)
-            self.rope_sin[pos] = np.sin(pos * theta)
+    def _get_rope_theta(self):
+        with open(self._atlas_path, 'rb') as f:
+            f.read(21)
+            return struct.unpack('<d', f.read(8))[0]
 
     def _load_weight_f16(self, name, shape=None):
         """Load a float16 weight tensor from atlas, return as float32 numpy."""
@@ -128,7 +125,6 @@ class AtlasModel:
         sz = ctypes.c_int()
         ptr = dll.atlas_tensor_data(self.model_ptr, idx, sz)
         if not ptr: return None, None, None
-        if not ptr: return None, None, None, None
         raw = np.ctypeslib.as_array(ptr, shape=(sz.value,))
         scale_raw = struct.unpack('<H', raw[:2].tobytes())[0]
         scale = np.frombuffer(struct.pack('<H', scale_raw), dtype=np.float16)[0].item()
@@ -210,7 +206,8 @@ class AtlasModel:
         dll.atlas_rope_f32(
             q.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
             k.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-            self.n_heads, self.n_kv_heads, self.head_dim, position)
+            self.n_heads, self.n_kv_heads, self.head_dim,
+            position, ctypes.c_float(self.rope_theta))
 
     def _silu(self, x):
         return x * (1.0 / (1.0 + np.exp(-x)))

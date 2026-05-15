@@ -66,6 +66,7 @@ struct AtlasModel {
     int n_kv_heads;
     int head_dim;
     int vocab_size;
+    float rope_theta;
     std::vector<TensorInfo> tensors;
 };
 
@@ -87,10 +88,17 @@ ATLAS_API AtlasModel* atlas_load(const char* path) {
     memcpy(&tmp, hdr+15, 2); m->head_dim = tmp;
     uint32_t tmp32; memcpy(&tmp32, hdr+17, 4); m->vocab_size = (int)tmp32;
     int n_tensors; memcpy(&n_tensors, hdr+60, 4);
+    uint16_t version; memcpy(&version, hdr+5, 2);
+    if (version >= 3) {
+        double rt; memcpy(&rt, hdr+21, 8); m->rope_theta = (float)rt;
+    } else {
+        m->rope_theta = 10000.0f;  // default for old files
+    }
 
-    printf("[ATLAS] v2 model: %dL %dH %dI %d/%d heads %d vocab | %d tensors\n",
+    printf("[ATLAS] v%d model: %dL %dH %dI %d/%d heads %d vocab %.0f theta | %d tensors\n",
+           version,
            m->n_layers, m->hidden_dim, m->inter_dim, m->n_heads, m->n_kv_heads,
-           m->vocab_size, n_tensors);
+           m->vocab_size, m->rope_theta, n_tensors);
 
     // Read directory
     m->tensors.resize(n_tensors);
@@ -270,8 +278,8 @@ ATLAS_API void atlas_rmsnorm_f32(const float* x, const uint8_t* weight_f16,
 // Modifies q and k in-place for a single position
 // q/k: [n_heads × head_dim] float32 (interleaved format)
 ATLAS_API void atlas_rope_f32(float* q, float* k, int n_heads, int n_kv_heads,
-                               int head_dim, int position) {
-    float theta_base = 10000.0f;
+                               int head_dim, int position, float rope_theta) {
+    float theta_base = rope_theta;
     for (int h = 0; h < n_heads; h++) {
         float* qh = q + h * head_dim;
         for (int i = 0; i < head_dim / 2; i++) {

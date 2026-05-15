@@ -30,10 +30,10 @@ pip install numpy safetensors transformers torch
 ### 1. Pack safetensors into ATLAS format
 
 ```bash
-python atlas_packer.py C:\models\Falcon3-7B-Instruct-1.58bit falcon3-7b-tq1.atlas
+python atlas_packer.py C:\models\Falcon3-7B-Instruct-1.58bit\model.safetensors falcon3-7b-tq1.atlas
 ```
 
-The packer reads `model.safetensors` from the input directory, de-interleaves BitNet's 4-row-packed uint8 format, repacks each weight row into TQ1 Base-3 bytes, and writes an ATLAS file with a 64-byte header, 12-byte-per-tensor directory, and tensor data blobs.
+The packer reads the safetensors file, de-interleaves BitNet's 4-row-packed uint8 format, repacks each weight row into TQ1 Base-3 bytes, and writes an ATLAS file with a 64-byte header, 12-byte-per-tensor directory, and tensor data blobs. The model directory (containing `config.json` and tokenizer) is inferred from the safetensors path.
 
 ### 2. Run inference
 
@@ -54,7 +54,7 @@ Requires `clang++` (LLVM MinGW) in PATH. Builds `atlas.dll` with AVX2, FMA, Open
 ## Architecture
 
 ```
-safetensors ──► atlas_packer.py ──► .atlas file ──► atlas.dll (C++) ──► atlas_infer.py (Python)
+safetensors ──► atlas_packer.py ──► .atlas file ──► atlas_infer.py (Python) ──► atlas.dll (C++)
 ```
 
 ### Pipeline stages
@@ -116,7 +116,6 @@ After all three fixes, all layer-0 TQ1 projections match the HuggingFace referen
 | `atlas_kernel.hpp` | Header-only LUT + matmul kernels |
 | `atlas.dll` | Prebuilt DLL (Clang LLVM-MinGW) |
 | `compile.bat` | DLL build script |
-| `falcon3-10b-tq1.atlas` | Packed Falcon3-10B model |
 | `test_direct_cmp.py` | Atlas file vs HF ternary values (no model load) |
 | `test_kernel_row.py` | Single-row kernel vs pure Python |
 | `test_row_order.py` | Row reordering demonstration (corr 0.006 vs 0.999) |

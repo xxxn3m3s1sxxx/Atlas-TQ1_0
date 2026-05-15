@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Atlas Packer v2 - Streaming TQ1.0 packer for Falcon3 BitNet"""
-import struct, torch, numpy as np, json, os
+import struct, torch, numpy as np, json, os, sys
 from safetensors import safe_open
 
 BITNET_MUL = np.array([1, 3, 9, 27], dtype=np.uint32)
@@ -58,6 +58,7 @@ def create_atlas_from_config(safetensors_path, output_path):
     inter = cfg['intermediate_size']
     vocab = cfg['vocab_size']
     head_dim = cfg.get('head_dim', hidden // n_heads)
+    rope_theta = cfg.get('rope_theta', 10000.0)
 
     print(f"  Layers:{n_layers} Hidden:{hidden} Heads:{n_heads}/{n_kv_heads}")
     print(f"  Intermediate:{inter} Vocab:{vocab} Head_dim:{head_dim}")
@@ -80,7 +81,7 @@ def create_atlas_from_config(safetensors_path, output_path):
         n_tensors = len(names)
         header = bytearray(64)
         header[0:5] = b'ATLAS'
-        struct.pack_into('<H', header, 5, 2)
+        struct.pack_into('<H', header, 5, 3)  # v3: added rope_theta at offset 21
         struct.pack_into('<H', header, 7, n_layers)
         struct.pack_into('<H', header, 9, hidden)
         struct.pack_into('<H', header, 11, inter)
@@ -88,6 +89,7 @@ def create_atlas_from_config(safetensors_path, output_path):
         struct.pack_into('<B', header, 14, n_kv_heads)
         struct.pack_into('<H', header, 15, head_dim)
         struct.pack_into('<I', header, 17, vocab)
+        struct.pack_into('<d', header, 21, rope_theta)
         struct.pack_into('<I', header, 60, n_tensors)
         out.write(header)
 
