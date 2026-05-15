@@ -1,14 +1,22 @@
 """Verify: pure Python with correct row ordering vs reference."""
-import torch, numpy as np, pickle
+import torch, sys, numpy as np, pickle
 from safetensors import safe_open
 
-with open(r'C:\atlas\ref_activations.pkl', 'rb') as f:
+if __name__ == '__main__':
+    if len(sys.argv) < 4:
+        print("Usage: python test_row_order.py <atlas.tq1> <model.safetensors> <ref_activations.pkl>")
+        sys.exit(1)
+
+safetensors_path = sys.argv[2]
+ref_path = sys.argv[3]
+
+with open(ref_path, 'rb') as f:
     ref_data = pickle.load(f)
 act = ref_data['activations']
 ref_pn = act['L0_post_norm_in'][0]
 ref_gate = act['L0_gate_out'][0]
 
-with safe_open(r'C:\models\Falcon3-7B-Instruct-1.58bit\model.safetensors',
+with safe_open(safetensors_path,
                framework='pt', device='cpu') as f:
     w_u8 = f.get_tensor("model.layers.0.mlp.gate_proj.weight").numpy()
     weight_scale = f.get_tensor("model.layers.0.mlp.gate_proj.weight_scale").item()

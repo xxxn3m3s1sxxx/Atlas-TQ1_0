@@ -1,9 +1,17 @@
 """Directly compare atlas ternary values vs HF reference (no atlas model load)."""
-import struct, numpy as np
+import struct, sys, numpy as np
 from safetensors import safe_open
 
+if __name__ == '__main__':
+    if len(sys.argv) < 3:
+        print("Usage: python test_direct_cmp.py <atlas.tq1> <model.safetensors>")
+        sys.exit(1)
+
+atlas_path = sys.argv[1]
+safetensors_path = sys.argv[2]
+
 # ─── Read atlas directory ───────────────────────────────────────────────
-with open(r'C:\atlas\falcon3-7b-tq1.atlas', 'rb') as f:
+with open(atlas_path, 'rb') as f:
     magic = f.read(5)
     version = struct.unpack('<H', f.read(2))[0]
     n_layers = struct.unpack('<H', f.read(2))[0]
@@ -26,8 +34,7 @@ with open(r'C:\atlas\falcon3-7b-tq1.atlas', 'rb') as f:
     # Build name→entry mapping from atlas_infer.py tensor order
     # We need tensor names to match indices
     # Let's first just get the gate_proj entry by looking at all entries
-    from safetensors import safe_open
-    with safe_open(r'C:\models\Falcon3-7B-Instruct-1.58bit\model.safetensors',
+    with safe_open(safetensors_path,
                    framework='pt', device='cpu') as sf:
         names = list(sf.keys())
     
@@ -58,7 +65,7 @@ with open(r'C:\atlas\falcon3-7b-tq1.atlas', 'rb') as f:
         print(f"  TQ1 byte 1: {b1} ({bin(b1)})")
 
 # ─── Read HF reference ─────────────────────────────────────────────────
-with safe_open(r'C:\models\Falcon3-7B-Instruct-1.58bit\model.safetensors',
+with safe_open(safetensors_path,
                framework='pt', device='cpu') as f:
     w_u8 = f.get_tensor(gp_name).numpy()
 

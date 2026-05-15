@@ -1,16 +1,25 @@
 """Compare TQ1 kernel output vs pure Python for ONE output row."""
-import ctypes, struct, numpy as np, pickle, os
+import ctypes, struct, sys, numpy as np, pickle, os
 from safetensors import safe_open
 os.environ['PYTHONIOENCODING'] = 'utf-8'
 
-with open(r'C:\atlas\ref_activations.pkl', 'rb') as f:
+if __name__ == '__main__':
+    if len(sys.argv) < 4:
+        print("Usage: python test_kernel_row.py <atlas.tq1> <model.safetensors> <ref_activations.pkl>")
+        sys.exit(1)
+
+atlas_path = sys.argv[1]
+safetensors_path = sys.argv[2]
+ref_path = sys.argv[3]
+
+with open(ref_path, 'rb') as f:
     ref_data = pickle.load(f)
 act = ref_data['activations']
 ref_pn = act['L0_post_norm_in'][0]  # [3072]
 ref_gate = act['L0_gate_out'][0]    # [23040], reference output
 
 # Load weights from safetensors (small: just unpack third of the rows)
-with safe_open(r'C:\models\Falcon3-7B-Instruct-1.58bit\model.safetensors',
+with safe_open(safetensors_path,
                framework='pt', device='cpu') as f:
     w_u8 = f.get_tensor("model.layers.0.mlp.gate_proj.weight").numpy()
     weight_scale = f.get_tensor("model.layers.0.mlp.gate_proj.weight_scale").item()
@@ -42,7 +51,7 @@ print(f"Pure Python out: {out_py}")
 
 # Now via TQ1 kernel (need atlas model, avoid full load)
 # Instead: decode TQ1 bytes from atlas and compute dot product manually
-with open(r'C:\atlas\falcon3-7b-tq1.atlas', 'rb') as f:
+with open(atlas_path, 'rb') as f:
     f.seek(64)
     dir_data = f.read(451 * 12)
     idx = 5  # gate_proj index
