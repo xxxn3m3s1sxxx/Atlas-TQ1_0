@@ -30,7 +30,7 @@ pip install numpy safetensors transformers torch
 ### 1. Pack safetensors into ATLAS format
 
 ```bash
-python atlas_packer.py C:\models\Falcon3-7B-Instruct-1.58bit\model.safetensors falcon3-7b-tq1.atlas
+python atlas_packer.py path/to/model.safetensors model.atlas
 ```
 
 The packer reads the safetensors file, de-interleaves BitNet's 4-row-packed uint8 format, repacks each weight row into TQ1 Base-3 bytes, and writes an ATLAS file with a 64-byte header, 12-byte-per-tensor directory, and tensor data blobs. The model directory (containing `config.json` and tokenizer) is inferred from the safetensors path.
@@ -38,7 +38,7 @@ The packer reads the safetensors file, de-interleaves BitNet's 4-row-packed uint
 ### 2. Run inference
 
 ```bash
-python atlas_infer.py falcon3-7b-tq1.atlas C:\models\Falcon3-7B-Instruct-1.58bit "What is the capital of France?"
+python atlas_infer.py model.atlas path/to/model_dir "What is the capital of France?"
 ```
 
 The inference script loads the atlas file into the C++ DLL, initializes the tokenizer from the model directory, and runs autoregressive generation with GQA attention, RoPE, KV cache, SiLU FFN, and temperature sampling.

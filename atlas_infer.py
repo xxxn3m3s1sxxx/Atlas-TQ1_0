@@ -50,6 +50,24 @@ dll.atlas_rope_f32.argtypes = [ctypes.POINTER(ctypes.c_float),
     ctypes.POINTER(ctypes.c_float), ctypes.c_int, ctypes.c_int,
     ctypes.c_int, ctypes.c_int, ctypes.c_float]
 
+dll.atlas_attention_f32.restype = None
+dll.atlas_attention_f32.argtypes = [
+    ctypes.POINTER(ctypes.c_float),   # q
+    ctypes.POINTER(ctypes.c_float),   # k
+    ctypes.POINTER(ctypes.c_float),   # v
+    ctypes.POINTER(ctypes.c_int),     # positions
+    ctypes.POINTER(ctypes.c_uint16),  # k_cache
+    ctypes.POINTER(ctypes.c_uint16),  # v_cache
+    ctypes.c_int,     # max_seq_len
+    ctypes.c_int,     # seq_now
+    ctypes.c_int,     # B
+    ctypes.c_int,     # n_heads
+    ctypes.c_int,     # n_kv_heads
+    ctypes.c_int,     # head_dim
+    ctypes.c_float,   # rope_theta
+    ctypes.POINTER(ctypes.c_float),   # output
+]
+
 # ─── Model class ─────────────────────────────────────────────────────────
 class AtlasModel:
     def __init__(self, atlas_path, safetensors_path):
@@ -192,14 +210,18 @@ class AtlasModel:
         return result.reshape(B, -1, w.shape[0]) if act.ndim > 2 else result
 
     def _rmsnorm(self, x, weight_name, eps=1e-6):
-        w_f32 = self._load_weight_f16(weight_name)
-        if w_f32 is None: return x
-        # DLL expects raw float16 bytes — re-encode
-        w_raw = w_f32.astype(np.float16).tobytes()
+        if weight_name not in self._f16_cache:
+            idx = self.idx.get(weight_name)
+            if idx is None: return x
+            sz = ctypes.c_int()
+            ptr = dll.atlas_tensor_data(self.model_ptr, idx, sz)
+            if not ptr: return x
+            raw = np.ctypeslib.as_array(ptr, shape=(sz.value,))
+            self._f16_cache[weight_name] = raw.tobytes()
         out = np.zeros_like(x)
         dll.atlas_rmsnorm_f32(
             x.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-            ctypes.cast(ctypes.create_string_buffer(w_raw), ctypes.POINTER(ctypes.c_uint8)),
+            ctypes.cast(ctypes.create_string_buffer(self._f16_cache[weight_name]), ctypes.POINTER(ctypes.c_uint8)),
             out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
             len(x), ctypes.c_float(eps))
         return out
@@ -233,54 +255,22 @@ class AtlasModel:
         k = _mt(f"{prefix}.self_attn.k_proj.weight", x_norm)
         v = _mt(f"{prefix}.self_attn.v_proj.weight", x_norm)
 
-        # Reshape to multi-head
-        q = q.reshape(B, self.n_heads, self.head_dim)
-        k = k.reshape(B, self.n_kv_heads, self.head_dim)
-        v = v.reshape(B, self.n_kv_heads, self.head_dim)
-
-        # Apply RoPE
-        for b in range(B):
-            self._apply_rope(q[b].ravel(), k[b].ravel(), positions[b])
-
-        # KV Cache
-        if use_kvcache:
-            for b in range(B):
-                pos = positions[b]
-                self.k_cache[layer_idx, :, pos, :] = k[b].astype(np.float16)
-                self.v_cache[layer_idx, :, pos, :] = v[b].astype(np.float16)
-            max_pos = max(positions)
-            # k_cache: [n_kv_heads, seq, head_dim] -> transpose to [seq, n_kv_heads, head_dim]
-            k_cache = self.k_cache[layer_idx, :, :max_pos+1, :].astype(np.float32)
-            v_cache = self.v_cache[layer_idx, :, :max_pos+1, :].astype(np.float32)
-            k_cache = k_cache.transpose(1, 0, 2)  # [seq, kv_heads, head_dim]
-            v_cache = v_cache.transpose(1, 0, 2)
-        else:
-            k_cache = k
-            v_cache = v
-
-        # GQA attention
-        # Expand KV heads to match Q heads (12/4 = 3 repeats)
-        n_rep = self.n_heads // self.n_kv_heads
-        k_cache = np.repeat(k_cache, n_rep, axis=1)  # [seq, n_heads, head_dim]
-        v_cache = np.repeat(v_cache, n_rep, axis=1)
-
-        # Scaled dot-product attention
-        # q: [B, n_heads, head_dim], k_cache: [seq, n_heads, head_dim]
-        # scores: [B, n_heads, seq]
-        scores = np.einsum('bhd,shd->bhs', q, k_cache) / np.sqrt(self.head_dim)
-        # Causal mask: zero out future positions
-        seq_len = k_cache.shape[0]
-        for b in range(B):
-            pos = positions[b]
-            if pos + 1 < seq_len:
-                scores[b, :, pos + 1:] = -1e9
-        # Softmax
-        scores_max = np.max(scores, axis=-1, keepdims=True)
-        attn = np.exp(scores - scores_max)
-        attn /= attn.sum(axis=-1, keepdims=True) + 1e-10
-        # Weighted sum
-        attn_out = np.einsum('bhs,shd->bhd', attn, v_cache)  # [B, n_heads, head_dim]
-        attn_out = attn_out.reshape(B, self.hidden)
+        # Fused RoPE + GQA attention + causal mask + softmax + weighted sum
+        attn_out = np.zeros((B, self.hidden), dtype=np.float32)
+        seq_now = max(positions) + 1 if use_kvcache else B
+        # k/v_cache: [n_kv_heads, max_seq, head_dim] — pass raw uint16 pointers
+        kp = self.k_cache[layer_idx].ctypes.data_as(ctypes.POINTER(ctypes.c_uint16))
+        vp = self.v_cache[layer_idx].ctypes.data_as(ctypes.POINTER(ctypes.c_uint16))
+        dll.atlas_attention_f32(
+            q.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            k.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            v.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            (ctypes.c_int * B)(*positions),
+            kp, vp,
+            self.max_seq_len, seq_now, B,
+            self.n_heads, self.n_kv_heads, self.head_dim,
+            ctypes.c_float(self.rope_theta),
+            attn_out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)))
 
         # Output projection
         p, pc, r, s = self._load_tq1(f"{prefix}.self_attn.o_proj.weight")

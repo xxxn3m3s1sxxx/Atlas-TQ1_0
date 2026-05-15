@@ -306,4 +306,124 @@ ATLAS_API void atlas_rope_f32(float* q, float* k, int n_heads, int n_kv_heads,
     }
 }
 
+// ─── Fused attention: RoPE + GQA + softmax + weighted sum ────────────
+// q: [B, n_heads * head_dim] float32 — RoPE applied in-place, modified
+// k: [B, n_kv_heads * head_dim] float32 — RoPE applied in-place, modified
+// v: [B, n_kv_heads * head_dim] float32
+// positions: [B] int32
+// k_cache: [n_kv_heads, max_seq, head_dim] uint16 (fp16) — updated + read
+// v_cache: [n_kv_heads, max_seq, head_dim] uint16 (fp16) — updated + read
+// output: [B, n_heads * head_dim] float32
+ATLAS_API void atlas_attention_f32(
+    float* q, float* k, float* v, const int* positions,
+    const uint16_t* k_cache, const uint16_t* v_cache,
+    int max_seq_len, int seq_now, int B,
+    int n_heads, int n_kv_heads, int head_dim,
+    float rope_theta, float* output) {
+
+    int n_rep = n_heads / n_kv_heads;
+    float inv_sqrt_d = 1.0f / sqrtf((float)head_dim);
+
+    for (int b = 0; b < B; b++) {
+        int pos = positions[b];
+        float* qb = q + b * n_heads * head_dim;
+        float* kb = k + b * n_kv_heads * head_dim;
+        float* vb = v + b * n_kv_heads * head_dim;
+
+        // RoPE on Q
+        for (int h = 0; h < n_heads; h++) {
+            float* qh = qb + h * head_dim;
+            for (int i = 0; i < head_dim / 2; i++) {
+                float freq = 1.0f / powf(rope_theta, 2.0f * i / head_dim);
+                float c = cosf(pos * freq), s = sinf(pos * freq);
+                float a = qh[2*i], b0 = qh[2*i+1];
+                qh[2*i]   = a * c - b0 * s;
+                qh[2*i+1] = a * s + b0 * c;
+            }
+        }
+        // RoPE on K
+        for (int h = 0; h < n_kv_heads; h++) {
+            float* kh = kb + h * head_dim;
+            for (int i = 0; i < head_dim / 2; i++) {
+                float freq = 1.0f / powf(rope_theta, 2.0f * i / head_dim);
+                float c = cosf(pos * freq), s = sinf(pos * freq);
+                float a = kh[2*i], b0 = kh[2*i+1];
+                kh[2*i]   = a * c - b0 * s;
+                kh[2*i+1] = a * s + b0 * c;
+            }
+        }
+
+        // Store K, V into cache (fp32 -> fp16 on the fly)
+        for (int h = 0; h < n_kv_heads; h++) {
+            for (int d = 0; d < head_dim; d++) {
+                uint16_t* kc = (uint16_t*)k_cache + h * max_seq_len * head_dim + pos * head_dim + d;
+                uint16_t* vc = (uint16_t*)v_cache + h * max_seq_len * head_dim + pos * head_dim + d;
+                auto f32_to_f16 = [](float val) -> uint16_t {
+                    uint32_t b; memcpy(&b, &val, 4);
+                    uint16_t s = (b >> 16) & 0x8000;
+                    int exp_f32 = (b >> 23) & 0xFF;
+                    int exp_f16 = exp_f32 - 127 + 15;
+                    if (exp_f16 <= 0) return s;
+                    if (exp_f16 >= 31) return (uint16_t)(s | 0x7C00 | ((b >> 13) & 0x3FF));
+                    return (uint16_t)(s | ((uint16_t)exp_f16 << 10) | ((b >> 13) & 0x3FF));
+                };
+                *kc = f32_to_f16(kb[h * head_dim + d]);
+                *vc = f32_to_f16(vb[h * head_dim + d]);
+            }
+        }
+
+        // Attention scores [n_heads, seq_now] — stack-allocate (max 12*4096=196KB, fine on 1MB stack)
+        int max_seq = seq_now;
+        float* scores = (float*)alloca(n_heads * max_seq * sizeof(float));
+
+        for (int h = 0; h < n_heads; h++) {
+            int kh = h / n_rep;
+            for (int s = 0; s < max_seq; s++) {
+                float sum = 0.0f;
+                for (int d = 0; d < head_dim; d++) {
+                    float qv = qb[h * head_dim + d];
+                    uint16_t kv_raw = ((uint16_t*)k_cache)[kh * max_seq_len * head_dim + s * head_dim + d];
+                    float kv = fp16_to_fp32(kv_raw);
+                    sum += qv * kv;
+                }
+                scores[h * max_seq + s] = sum * inv_sqrt_d;
+            }
+        }
+
+        // Causal mask + softmax per head
+        for (int h = 0; h < n_heads; h++) {
+            float* sh = scores + h * max_seq;
+            float max_val = -1e9f;
+            for (int s = 0; s < max_seq; s++) {
+                float val = (s > pos) ? -1e9f : sh[s];
+                sh[s] = val;
+                if (val > max_val) max_val = val;
+            }
+            float sum = 0.0f;
+            for (int s = 0; s < max_seq; s++) {
+                float e = expf(sh[s] - max_val);
+                sh[s] = e;
+                sum += e;
+            }
+            float inv_sum = 1.0f / fmaxf(sum, 1e-10f);
+            for (int s = 0; s < max_seq; s++) sh[s] *= inv_sum;
+        }
+
+        // Weighted sum: output[h, d] = sum_s scores[h, s] * v_cache[kh, s, d]
+        for (int h = 0; h < n_heads; h++) {
+            int kh = h / n_rep;
+            float* sh = scores + h * max_seq;
+            for (int d = 0; d < head_dim; d++) {
+                float sum = 0.0f;
+                for (int s = 0; s < max_seq; s++) {
+                    uint16_t vv_raw = ((uint16_t*)v_cache)[kh * max_seq_len * head_dim + s * head_dim + d];
+                    float vv = fp16_to_fp32(vv_raw);
+                    sum += sh[s] * vv;
+                }
+                output[b * n_heads * head_dim + h * head_dim + d] = sum;
+            }
+        }
+    }
+}
+
 }  // extern "C"

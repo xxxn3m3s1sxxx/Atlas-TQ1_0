@@ -1,90 +1,65 @@
-# ATLAS — Falcon3-7B TQ1.0 Inference Engine
+# ATLAS — Falcon3 TQ1.0 Inference Engine
 
 ## Goal
-- Complete TQ1.0 (Base-3, 5 ternary trits/byte) inference engine for Falcon3-7B on i5 laptop, end-to-end text generation via C++ DLL + Python.
+- TQ1.0 (Base-3, 5 ternary trits/byte) inference engine for Falcon3-10B on i5 laptop, end-to-end text generation via C++ DLL + Python.
 
 ## Constraints & Preferences
-- 16 GB RAM only (no GPU); Falcon3-7B safetensors = 3.05 GB, atlas file = 2.74 GB.
+- 16 GB RAM only (no GPU); Falcon3-10B atlas file = 3.35 GB.
 - Target CPU: i5-1235U (Alder Lake, 8 OMP threads, AVX2+FMA).
-- Compiler: Clang 22.1.5 (LLVM MinGW x86_64-w64-windows-gnu).
-- Base-3 encoding: byte V = m0 + m1·3 + m2·9 + m3·27 + m4·81 (m_i∈{0,1,2}→ternary{-1,0,1}), V∈[0,242].
-- Row-aware packing: each BitNet uint8 row holds 4 interleaved weight rows; de-interleave before TQ1 repack.
-- Per-tensor FP16 scale from `weight_scale` safetensors, stored as 2-byte prefix.
-- 12-byte tensor directory: [ttype:1][offset:4][row_dim:4][packed_per_row:3]; n_tensors at byte 60.
-- 5 separate LUTs (float[256], 32-byte aligned).
-- Matmul outputs row-major: `output[t * rows + r]`.
-- Model: `LlamaForCausalLM` with `BitLinear` wrappers, `hidden_size=3072`, `intermediate_size=23040`, `num_attention_heads=12`, `num_key_value_heads=4`, `head_dim=256`, `rope_theta=1000042`, `rms_norm_eps=1e-6`.
-- Safetensors weights are pre-quantized: **2-bit packing** (`byte = v0 + v1·4 + v2·16 + v3·64`, v_i∈{0,1,2,3}) for `nn.Linear` layers; `bfloat16` for `lm_head.weight`, `embed_tokens.weight`, norms.
+- Compiler: Clang 22.1.5 (LLVM MinGW x86_64-w64-windows-gnu) from WinGet.
+- OpenMP: dynamic link via `libomp.dll` (shipped with LLVM-MinGW). Set `KMP_DUPLICATE_LIB_OK=TRUE` to avoid conflict with numpy MKL's `libiomp5md.dll`.
+- Base-3 encoding and matmul kernels as before.
+- Same model architecture (1000042 theta, GQA 12/4 heads, etc).
+- **10B model only** on current machine (40 layers). No 7B safetensors available — only a GGUF variant exists.
 
 ## Progress
 ### Done
-- Packed Falcon3-7B into `C:\atlas\falcon3-7b-tq1.atlas` (2.74 GB, 451 tensors, 196 TQ1 weight tensors).
-- Wrote `atlas_kernel.hpp` (LUT, TQ1Mat, scalar unrolled-4x matmul).
-- Wrote `atlas_api.cpp` (C-exported DLL: load, matmul, rmsnorm, rope).
-- Compiled `atlas_bench.exe` (scalar kernel); benchmarked down_proj [3072×23040]: 165 tok/s peak.
-- Wrote `atlas_infer.py` (AtlasModel class with GQA attention, RoPE, KV cache, SiLU FFN).
-- Fixed DLL runtime by copying `libc++.dll`, `libunwind.dll`, `libomp.dll` from MinGW bin/ into C:\atlas.
-- Fixed `file_offset` overflow (int→uint32_t in TensorInfo).
-- Fixed `_load_tq1` ctypes pointer arithmetic (`addressof(ptr.contents)+2` instead of `ptr+2`).
-- Fixed matmul activation padding (pad to `packed_cols * 5` when input dim < padded dim).
-- Fixed GQA attention — working einsum shapes and KV cache indexing.
-- Fixed RMSNorm weight pointer (`_load_weight_f16` returned float32; DLL expected raw float16 bytes).
-- Added activation quantization (`_matmul_tq1` BitNet round-trip: quantize→matmul→dequantize with per-token `max_abs`).
-- **Fixed `fseek` 32-bit overflow**: replaced with `_fseeki64(f, (int64_t)offset, SEEK_SET)` via `FSEEK` macro.
-- **Recompiled atlas.dll** with fseek fix; all 28 layers now complete without NaN.
-- **Added `_matmul_f16` method** for non-TQ1 float16 tensors (LM head `ttype=2`).
-- **HF reference model runs** via `torch._dynamo.config.suppress_errors=True` (TorchInductor Windows bug suppressed). Reference top-1 for BOS: token 12 (`'\n'`); L0 RMS=0.34; L28 RMS=1.63; logits RMS=3.45.
-- **Fixed packer 2-bit packing bug**: Safetensors use 2-bit packing (`byte = v0 + v1·4 + v2·16 + v3·64`), but packer was using Base-3 decoding (`%3, //3`). Fixed in `atlas_packer.py`.
-- **Re-packed atlas** with 2-bit fix; ternary values now match HF reference exactly.
-- **ROOT CAUSE FIX: Row ordering bug**. Atlas stores TQ1 rows in interleaved order (`ur*4+q`), but HF `unpack_weights` produces output in stride order (`q*5760+ur`). After C++ matmul, output must be reordered. Without this fix, corr≈0 despite correct ternary values. Fix: `out.reshape(batch, rows_packed, 4).transpose(0, 2, 1).reshape(batch, rows)`.
-- **Verified**: All L0 TQ1 projections match reference with corr > 0.999 (gate=0.999932, up=0.999928, down=0.999831). Small remaining diff from float16 accumulation vs float32.
-- **`save_ref_activations.py`**: Saves reference model activations via forward hooks (256 key+value tensors, 8.6 MB pickle).
-- **`test_direct_cmp.py`**: Direct atlas file vs HF ternary value comparison without loading atlas model (avoids pagefile crash).
-- **`test_pure_python.py`**: Pure NumPy matmul comparison (may be incomplete due to memory).
-- **`test_kernel_row.py`**: Single-row kernel vs pure Python comparison (confirmed row 0 matches).
-- **`test_row_order.py`**: Demonstrates corr≈0 vs corr≈1 with vs without row reordering.
+- Packed Falcon3-10B into `falcon3-10b-tq1.atlas` (3.35 GB, 643 tensors).
+- Core C++ DLL: load, matmul, rmsnorm, rope. Scalar LUT kernel, 4-way unrolled.
+- Python inference: full GQA attention (einsum + causal mask), RoPE, KV cache, SiLU FFN, autoregressive loop.
+- **fseek 32-bit overflow fix** (`_fseeki64` via FSEEK macro).
+- **2-bit packing fix** (was decoding as Base-3 instead of `& 3`, `>> 2`).
+- **Row ordering fix** (interleaved `ur*4+q` → stride `q*rows_packed+ur`). This was the root cause of corr≈0.
+- All L0 TQ1 projections verified corr > 0.999 with HF reference.
+- **OpenMP enabled**: `-fopenmp` in compile.bat, rebuilt `atlas.dll`.
+  - `down_proj` matmul: 31ms → 5.8ms (5.4× speedup)
+  - Decode: 0.3 → 1.0 tok/s on Falcon3-10B (3.3×)
+  - "What is 2+2?": 97s → 23s
+- `KMP_DUPLICATE_LIB_OK=TRUE` set in `atlas_infer.py` for numpy MKL compat.
+- README paths fixed to relative/portable.
+- `atlas_*.dll` temp builds gitignored.
 
-### In Progress
-- **Full 28-layer forward loop**: Need to implement GQA attention (RoPE, scaled_dot_product, KV cache), residual connections, and SiLU FFN in Python to complete end-to-end inference. Individual TQ1 projections verified corr > 0.999 with correct inputs.
+### Open
+- **7B model**: safetensors not present on this machine (`Falcon3-7B-Instruct-1.58bit-GGUF` is GGUF only). Would need download/re-pack for 7B testing.
+- **Performance ceiling**: Python overhead (attention einsum, per-layer loop) adds ~30% to per-token time vs pure C++.
+- **Prefill is slow**: 0.3 tok/s (same as decode) — no batching optimization.
 
 ### Blocked
-- **(none)**
+- (none)
 
 ## Key Decisions
-- **Row ordering fix is CRITICAL**: `atlas_matmul_f32` outputs in atlas order (`ur*4+q`). Must reorder to HF order (`q*rows_packed+ur`). This was the root cause of all "corr≈0 but RMS≈1" bugs.
-- **Divide by scale is correct**: `out = raw_sum * max_abs / (127 * scale)` matches HF `post_quant_process(y, weight_scale, input_scale)`.
-- **2-bit NOT Base-3 in safetensors**: Original packer incorrectly used Base-3 decoding. Fixed to 2-bit unpack.
 - **Scalar over AVX2 gather**: Gather was 4× slower (40 vs 162 tok/s) on Alder Lake.
-- **5 separate LUT arrays** (tq1_lut0..tq1_lut4) for register-based per-position access.
-- **No reverse-scaling in LUT**: Packer writes raw Base-3 (0..242), LUT reads `temp = b` directly.
+- **Dynamic OpenMP**: `libomp.dll` at runtime (no static libomp.a in LLVM-MinGW).
+- **5 separate LUT arrays** for register-based per-position access.
 - **Hybrid Python+C++**: Python handles norm, attention, RoPE; C++ DLL runs heavy TQ1 matmuls.
-- **KV cache**: 4096 tokens × float16 (≈0.94 GB for K+V).
+- **OMP_NUM_THREADS**: Defaults to all cores. On i5-1235U (2P+8E), 8 threads gives best throughput.
 
-## Next Steps
-1. **Complete full inference loop**: Implement GQA attention (RoPE, causal mask, KV cache), SiLU FFN, and residual connections in `atlas_infer.py` using fixed `_matmul_tq1`.
-2. **Test first token**: Run BOS → one generated token, compare token ID with reference (expected: 12).
-3. **End-to-end generation**: Implement temperature sampling, top-k, autoregressive loop with KV cache.
-4. **Benchmark**: Measure tok/s for generation.
-5. **Optionally optimize**: Profile C++ kernel, add AVX2 path if needed.
-
-## Critical Context
-- Atlas weight scales are **inverse BitNet α** (27–67), not `mean(|W_full|)` (0.01–0.3). Divide is correct; multiply is wrong.
-- **`fseek` 32-bit overflow** was the critical hidden bug corrupting all tensors >2 GB offset. Fixed by replacing with `_fseeki64`.
-- **Row ordering** was the SECOND critical bug: `out[batch, q*rows_packed+ur] = out_kernel[batch, ur*4+q]`.
-- With both fixes: all L0 TQ1 projections match reference with corr > 0.999.
-- The reference model wraps weights in `BitLinear` module. Forward: `activation_quant` (int8) → `F.linear(input_quant.to(dtype), unpacked_weights)` → `post_quant_process(y, weight_scale, input_scale)`. The `post_quant_process` is `@torch.compile` decorated (source of TorchInductor crash).
-- HF reference output was obtained via `torch._dynamo.config.suppress_errors = True` (skips TorchInductor-induced crash on Windows).
-- Pagefile limit prevents loading both atlas model + safetensors simultaneously (~6 GB total). Memory-efficient scripts (`test_direct_cmp.py`) avoid atlas model load by reading atlas file directly at byte offsets.
+## Potential Next Steps
+1. **Pack 7B model**: Download Falcon3-7B safetensors from HF, repack for 7B benchmarks.
+2. **Fuse operations**: Move attention (RoPE + score + softmax + weighted sum) into C++ DLL to reduce Python overhead.
+3. **Batch prefill**: Process prompt tokens in micro-batches for faster prefill.
+4. **Top-k/top-p sampling**: Add to `generate()` method.
+5. **AVX2 kernel**: Alternative gather-free AVX2 path for the big matmuls (down_proj, gate_proj, up_proj).
+6. **Profile guided optimization**: Use VTune or perf to find remaining bottlenecks.
 
 ## Relevant Files
-- `C:\atlas\atlas_packer.py`: Packer — 2-bit unpacking (lines 25–30). Run to re-pack atlas.
-- `C:\atlas\atlas_infer.py`: Python inference engine — `_matmul_f16` for LM head, `_matmul_tq1` with activation quant + row reordering.
-- `C:\atlas\atlas_api.cpp`: C-exported DLL — fseek fix applied (`FSEEK` macro).
-- `C:\atlas\atlas_kernel.hpp`: Header-only TQ1 matmul kernels (unused if using atlas_api.cpp directly).
-- `C:\atlas\falcon3-7b-tq1.atlas`: Packed model (2.74 GB, re-packed with 2-bit fix).
-- `C:\atlas\ref_activations.pkl`: Saved reference model activations (256 tensors).
-- `C:\atlas\diagnose_calibrate.py`: Layer-0 kernel injection + per-row scale comparison.
-- `C:\atlas\test_direct_cmp.py`: Direct atlas file vs HF ternary value comparison (minimal memory).
-- `C:\atlas\test_kernel_row.py`: Single-row kernel vs pure Python comparison.
-- `C:\atlas\test_row_order.py`: Demonstrates row ordering fix (corr 0.006 → 0.999).
-- `C:\models\Falcon3-7B-Instruct-1.58bit\`: Original safetensors + config + tokenizer.
+- `atlas_packer.py`: Packer — streams safetensors → TQ1 ATLAS file.
+- `atlas_infer.py`: Python inference engine — full forward pass + generate.
+- `atlas_api.cpp`: C-exported DLL — load, matmul, rmsnorm, rope.
+- `atlas_kernel.hpp`: Header-only TQ1 matmul kernels (AVX2 gather + scalar).
+- `atlas.dll`: Prebuilt DLL with OpenMP (80 KB) + `libomp.dll` (968 KB).
+- `compile.bat`: DLL build script (`clang++ -fopenmp -O2 -mavx2 -mfma`).
+- `test_direct_cmp.py`: Atlas file vs HF ternary value comparison.
+- `test_kernel_row.py`: Single-row kernel vs pure Python.
+- `test_row_order.py`: Row reordering demonstration.
+- `C:\models\Falcon3-10B-Instruct-1.58bit\`: Safetensors + config + tokenizer.
