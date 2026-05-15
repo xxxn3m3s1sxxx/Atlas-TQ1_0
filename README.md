@@ -1,0 +1,137 @@
+# ATLAS — TQ1.0 Ternary Inference Engine
+
+ATLAS is a CPU-based inference engine for BitNet b1.58 ternary-quantized language models. It repacks HuggingFace safetensors into the **TQ1.0** format (5 ternary trits packed per byte, Base-3 encoded) and runs fast inference through a hybrid C++ DLL + Python pipeline. No GPU required.
+
+## Motivation
+
+BitNet b1.58 models replace full-precision weights with ternary values (-1, 0, +1), reducing memory by 16-32x versus FP16. However, existing inference frameworks target CUDA GPUs, leaving CPU users unable to run these models. ATLAS fills this gap: it packs ternary weights into a compact TQ1 format and uses lookup-table (LUT) matmuls on CPU to achieve usable decode speeds on commodity hardware.
+
+## Supported Models
+
+| Model | Parameters | Atlas Size | Layers | Architecture |
+|-------|-----------|-----------|--------|--------------|
+| Falcon3-7B-Instruct-1.58bit | 7B | 2.74 GB | 28 | LlamaForCausalLM + BitLinear |
+| Falcon3-10B-Instruct-1.58bit | 10B | 3.27 GB | 40 | LlamaForCausalLM + BitLinear |
+
+## Quick Start
+
+### Requirements
+
+- Python 3.10+ with `numpy`, `safetensors`, `transformers`, `torch`
+- 16 GB RAM (no GPU)
+- Clang 22.1.5+ (LLVM MinGW) to rebuild the DLL (optional)
+- Windows (originally developed on i5-1235U, portable to Linux with `fseek`/`fseeko` change)
+
+```
+pip install numpy safetensors transformers torch
+```
+
+### 1. Pack safetensors into ATLAS format
+
+```bash
+python atlas_packer.py C:\models\Falcon3-7B-Instruct-1.58bit falcon3-7b-tq1.atlas
+```
+
+The packer reads `model.safetensors` from the input directory, de-interleaves BitNet's 4-row-packed uint8 format, repacks each weight row into TQ1 Base-3 bytes, and writes an ATLAS file with a 64-byte header, 12-byte-per-tensor directory, and tensor data blobs.
+
+### 2. Run inference
+
+```bash
+python atlas_infer.py falcon3-7b-tq1.atlas C:\models\Falcon3-7B-Instruct-1.58bit "What is the capital of France?"
+```
+
+The inference script loads the atlas file into the C++ DLL, initializes the tokenizer from the model directory, and runs autoregressive generation with GQA attention, RoPE, KV cache, SiLU FFN, and temperature sampling.
+
+### 3. Compile the DLL (if modifying C++ code)
+
+```bash
+compile.bat
+```
+
+Requires `clang++` (LLVM MinGW) in PATH. Builds `atlas.dll` with AVX2, FMA, OpenMP, and LTO.
+
+## Architecture
+
+```
+safetensors ──► atlas_packer.py ──► .atlas file ──► atlas.dll (C++) ──► atlas_infer.py (Python)
+```
+
+### Pipeline stages
+
+1. **Packer** (`atlas_packer.py`): Reads HuggingFace safetensors with pre-quantized 2-bit packed weights (`byte = v0 + v1*4 + v2*16 + v3*64`). De-interleaves the BitNet row-aware format (4 weight rows per uint8 row). Repacks each row independently into TQ1.0: 5 ternary trits mapped to Base-3 values 0-242, padded with ternary-0 (mapped from value 1) to fill the last byte. FP16 per-tensor scales are stored as 2-byte prefixes.
+
+2. **ATLAS file format**: Binary file with a 64-byte header (magic "ATLAS", layer count, hidden dim, intermediate dim, head counts, vocab size, tensor count). Followed by a directory of 12-byte entries (ttype, file offset, row dim, packed cols). Tensor data follows: TQ1 weights (ttype=0) have a 2-byte FP16 scale prefix followed by packed rows; embeddings/norms (ttype=1) and LM head (ttype=2) are raw FP16.
+
+3. **DLL** (`atlas_api.cpp` / `atlas_kernel.hpp`): Loads the atlas file into memory. Provides `atlas_matmul_f32` — a scalar LUT-based matrix multiply. For each output row, it iterates over packed bytes, uses 5 precomputed lookup tables (one per trit position in the byte) to decode ternary values inline, and accumulates into float32. OpenMP parallelizes over rows. Also provides RMSNorm and RoPE kernels.
+
+4. **Python inference** (`atlas_infer.py`): Coordinates the full LlamaForCausalLM forward pass. Activation quantization (per-token int8 round-trip via max-abs scaling). GQA attention with KV cache. SiLU-gated FFN. Autoregressive loop with top-1 or temperature sampling. All heavy matmuls call into the DLL; norms, attention, and RoPE run in NumPy.
+
+## Performance
+
+Measured on i5-1235U (Alder Lake, 8 OMP threads, AVX2+FMA, 16 GB DDR4).
+
+| Model | Single Projection (down_proj) | Estimated Decode (full token) |
+|-------|------------------------------|-------------------------------|
+| Falcon3-7B (28L, 3072x23040) | 165 tok/s peak (kernel only) | ~2-3 tok/s end-to-end |
+| Falcon3-10B (40L, 3840x28800) | ~120 tok/s (estimated) | ~3-4 tok/s end-to-end |
+
+End-to-end decode is dominated by the sequential autoregressive loop (one token at a time through all layers). Prefill (prompt processing) is batch-parallel and significantly faster. The scalar LUT kernel is bandwidth-bound on packed weight reads; an AVX2 gather path was attempted but measured 4x slower due to gather latency on Alder Lake.
+
+## Bugfix Chronology
+
+Three critical bugs were discovered and fixed during development. Any one of them would cause the model to produce garbage output (correlation near zero with reference activations).
+
+### Bug 1: `fseek` 32-bit overflow
+
+The ATLAS file for Falcon3-7B is 2.74 GB. Tensors beyond offset ~2 GB were being read from the wrong file position because `fseek` (32-bit) truncated the offset. Fixed by replacing with `_fseeki64` (Windows) / `fseeko` (POSIX) via a `FSEEK` macro.
+
+**Symptoms**: Layer-0 projections correct, deeper layers produce NaN or garbage.
+
+### Bug 2: 2-bit packing vs Base-3 unpacking
+
+HuggingFace BitNet safetensors store 2-bit packed ternary values: `byte = v0 + v1*4 + v2*16 + v3*64`. The original packer decoded them with `%3` and `//3` (Base-3), producing incorrect ternary values. Fixed by using `& 3`, `>> 2`, etc.
+
+**Symptoms**: Weight values off by ~5% per element, correlation still measurable (~0.5) but never reaching 1.0.
+
+### Bug 3: Row ordering (interleaved vs stride)
+
+BitNet stores weights in a row-aware interleaved format: uint8 row `ur` contains columns for output rows `4*ur+0` through `4*ur+3`. The C++ matmul output is in this interleaved order (`ur*4+q`). But the reference HuggingFace `unpack_weights` produces stride-order output (`q*rows_packed+ur`). Without reordering, every projected tensor had correlation near 0 despite correct ternary values.
+
+**Fix**: `out.reshape(batch, rows_packed, 4).transpose(0, 2, 1).reshape(batch, rows)`.
+
+**Symptoms**: Correlation ~0 with reference, but RMS magnitude was ~1. This was the most deceptive bug — it looked like a scale or encoding issue but was purely a layout mismatch.
+
+### Verification
+
+After all three fixes, all layer-0 TQ1 projections match the HuggingFace reference with correlation > 0.999 (gate=0.999932, up=0.999928, down=0.999831). The small remaining difference is from float16 accumulation in the reference vs float32 in ATLAS.
+
+## File Reference
+
+| File | Purpose |
+|------|---------|
+| `atlas_packer.py` | Streams safetensors → TQ1 ATLAS file |
+| `atlas_infer.py` | End-to-end inference engine (Python) |
+| `atlas_api.cpp` | C-exported DLL (load, matmul, norm, rope) |
+| `atlas_kernel.hpp` | Header-only LUT + matmul kernels |
+| `atlas.dll` | Prebuilt DLL (Clang LLVM-MinGW) |
+| `compile.bat` | DLL build script |
+| `falcon3-10b-tq1.atlas` | Packed Falcon3-10B model |
+| `test_direct_cmp.py` | Atlas file vs HF ternary values (no model load) |
+| `test_kernel_row.py` | Single-row kernel vs pure Python |
+| `test_row_order.py` | Row reordering demonstration (corr 0.006 vs 0.999) |
+| `diagnose_calibrate.py` | Layer-0 kernel injection with per-row scale comparison |
+
+## License
+
+This project is provided for research and educational purposes. The TQ1.0 format and inference engine are original work. BitNet b1.58 is from Microsoft Research. Falcon3 is from Technology Innovation Institute. Refer to each project's license for model weights and original code.
+
+## Citation
+
+If you use this work in research:
+
+```bibtex
+@misc{atlas-tq1,
+  title = {ATLAS: A TQ1.0 Ternary Inference Engine for BitNet b1.58 on CPU},
+  year = {2026}
+}
+```
