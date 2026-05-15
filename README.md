@@ -49,7 +49,9 @@ The inference script loads the atlas file into the C++ DLL, initializes the toke
 compile.bat
 ```
 
-Requires `clang++` (LLVM MinGW) in PATH. Builds `atlas.dll` with AVX2, FMA, OpenMP, and LTO.
+Requires `clang++` (LLVM MinGW) in PATH. Builds `atlas.dll` with AVX2 and FMA.
+
+OpenMP note: the matmul kernel has `#pragma omp parallel for` gated by `#ifdef _OPENMP`. If your MinGW toolchain has a static `libomp.a`, add `-fopenmp` to `compile.bat` for multi-core row-level parallelism (~5-6x speedup on 8 cores). The default build omits it because LLVM-MinGW only ships `libomp.dll.a` (dynamic import library), which requires `libomp.dll` at runtime.
 
 ## Architecture
 
@@ -66,6 +68,8 @@ safetensors ──► atlas_packer.py ──► .atlas file ──► atlas_infe
 3. **DLL** (`atlas_api.cpp` / `atlas_kernel.hpp`): Loads the atlas file into memory. Provides `atlas_matmul_f32` — a scalar LUT-based matrix multiply. For each output row, it iterates over packed bytes, uses 5 precomputed lookup tables (one per trit position in the byte) to decode ternary values inline, and accumulates into float32. OpenMP parallelizes over rows. Also provides RMSNorm and RoPE kernels.
 
 4. **Python inference** (`atlas_infer.py`): Coordinates the full LlamaForCausalLM forward pass. Activation quantization (per-token int8 round-trip via max-abs scaling). GQA attention with KV cache. SiLU-gated FFN. Autoregressive loop with top-1 or temperature sampling. All heavy matmuls call into the DLL; norms, attention, and RoPE run in NumPy.
+
+The scalar matmul kernel has row-level parallelism via `#pragma omp parallel for` that activates when compiled with `-fopenmp`. The prebuilt DLL is single-threaded since the bundled LLVM-MinGW lacks a static `libomp.a`. See `compile.bat` for details.
 
 ## Performance
 
