@@ -157,6 +157,15 @@ class AtlasModel:
 
         # No warmup needed — C++ lazily converts lm_head to fp32 on first atlas_forward call
 
+        # Pre-convert lm_head to fp32 at load time to avoid 1240ms first-token spike
+        # Adds 1.5 GB persistent RAM but saves ~1.2s warmup on first decode
+        print("[Atlas] Converting lm_head to fp32...")
+        t0 = time.time()
+        dummy = np.empty((1, self.hidden), dtype=np.float32)
+        self._matmul_f16("lm_head.weight", dummy)
+        print(f"[Atlas] lm_head ready ({time.time()-t0:.1f}s)")
+
+
     def _cache_indices(self):
         self.idx = {}
         for i, name in enumerate(self.tensor_names):
