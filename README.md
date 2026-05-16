@@ -129,19 +129,19 @@ All four fit in 16 GB RAM. **1B and 3B fit comfortably in 8 GB RAM**, making ATL
 
 Seven critical bugs were discovered and fixed during development. Any one of them would cause the model to produce garbage output (correlation near zero with reference activations) or crash.
 
-### Bug 1: `fseek` 32-bit overflow
+### Bug 1 [FIXED]: `fseek` 32-bit overflow
 
 The ATLAS file for Falcon3-7B is 2.74 GB. Tensors beyond offset ~2 GB were being read from the wrong file position because `fseek` (32-bit) truncated the offset. Fixed by replacing with `_fseeki64` (Windows) / `fseeko` (POSIX) via a `FSEEK` macro.
 
 **Symptoms**: Layer-0 projections correct, deeper layers produce NaN or garbage.
 
-### Bug 2: 2-bit packing vs Base-3 unpacking
+### Bug 2 [FIXED]: 2-bit packing vs Base-3 unpacking
 
 HuggingFace BitNet safetensors store 2-bit packed ternary values: `byte = v0 + v1*4 + v2*16 + v3*64`. The original packer decoded them with `%3` and `//3` (Base-3), producing incorrect ternary values. Fixed by using `& 3`, `>> 2`, etc.
 
 **Symptoms**: Weight values off by ~5% per element, correlation still measurable (~0.5) but never reaching 1.0.
 
-### Bug 3: Row ordering (interleaved vs stride)
+### Bug 3 [FIXED]: Row ordering (interleaved vs stride)
 
 BitNet stores weights in a row-aware interleaved format: uint8 row `ur` contains columns for output rows `4*ur+0` through `4*ur+3`. The C++ matmul output is in this interleaved order (`ur*4+q`). But the reference HuggingFace `unpack_weights` produces stride-order output (`q*rows_packed+ur`). Without reordering, every projected tensor had correlation near 0 despite correct ternary values.
 
@@ -149,13 +149,13 @@ BitNet stores weights in a row-aware interleaved format: uint8 row `ur` contains
 
 **Symptoms**: Correlation ~0 with reference, but RMS magnitude was ~1. This was the most deceptive bug — it looked like a scale or encoding issue but was purely a layout mismatch.
 
-### Bug 4: K/V cache swap
+### Bug 4 [FIXED]: K/V cache swap
 
 In `atlas_forward_layer`, K was written to `buf_hidden` but the attention copy read from `buf_up`; V was written to `buf_up` but read from `buf_hidden`. Fixed by swapping the copy destinations so K→buf_up and V→buf_hidden.
 
 **Symptoms**: Attention output garbage, correlation ~0 despite correct QKV projections.
 
-### Bug 5: `_rmsnorm` weight truncation (create_string_buffer)
+### Bug 5 [FIXED]: `_rmsnorm` weight truncation (create_string_buffer)
 
 `ctypes.create_string_buffer()` treats the input as a C-string and truncates at the first NULL byte (`\x00`). FP16 value `1.0` = bytes `\x00\x3C` (little-endian), so RMSNorm weights containing many values ≈1.0 got truncated at the first such value, zeroing most norm outputs. This was the root cause of layer 0 having corr=0.94 (not 1.0) in the C++ forward layer.
 
@@ -163,7 +163,7 @@ In `atlas_forward_layer`, K was written to `buf_hidden` but the attention copy r
 
 **Symptoms**: RMSNorm output had only the first element non-zero; layer output near zero for most elements. This was a double bug — `create_string_buffer` truncation AND `len(x)` returning 1 instead of 3072.
 
-### Bug 6: Snap buffer overflow (batch resize)
+### Bug 6 [FIXED]: Snap buffer overflow (batch resize)
 
 Debug snapshot buffers (`snap_q/k/v/o/norm1`) were allocated once with the initial batch size and never resized. Prefill (B=12) after decode warmup (B=1) wrote past the end, causing `OSError: exception: access violation writing 0x...` .
 
@@ -171,7 +171,7 @@ Debug snapshot buffers (`snap_q/k/v/o/norm1`) were allocated once with the initi
 
 **Symptoms**: Immediate access violation crash when switching from single-token decode to batched prefill.
 
-### Bug 7: Activation buffer overflow on non-aligned TQ1 dimensions
+### Bug 7 [FIXED]: Activation buffer overflow on non-aligned TQ1 dimensions
 
 TQ1 packing rounds dimensions up to multiples of 5: a projection with `inter_dim=8192` produces `packed_cols = ceil(8192/5) = 1639`, so the activation buffer must hold `1639 × 5 = 8195` floats per batch. But `max_aligned` was computed from the raw `inter_dim` (8192), rounding to 8192 via `(8192 + 31) & ~31`. The `memcpy(buf_act + b * 8195)` wrote 3 floats past the buffer end.
 
