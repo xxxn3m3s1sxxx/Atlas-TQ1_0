@@ -128,6 +128,17 @@ ATLAS_API void atlas_forward(void* model,
     int max_seq_len, int seq_now,
     const int* layer_idx, int n_layers);
 
+// ─── Int8 lm_head ─────────────────────────────────────────────────────
+// Quantize lm_head from fp16 to per-row symmetric int8 (~403 MB vs 1.5 GB fp32).
+// idx: tensor index of lm_head in the model's tensor list.
+// Frees the original fp16 data. Call after Python has created its fp32 copy.
+ATLAS_API void atlas_quantize_lmhead(void* model, int idx);
+
+// GEMV: B tokens [B × hidden_dim] → logits [B × vocab_size] via int8 lm_head.
+// AVX2 maddubs + offset trick + per-row dequant. OpenMP parallel over vocab.
+ATLAS_API void atlas_lmhead_gemv(void* model, const float* act,
+                                  float* output, int B);
+
 // ─── Int8 matmul (AVX2 maddubs) ──────────────────────────────────────
 // output[t][r] = sum_k act_u8[t][k] * w[r][k] - 128 * row_sums[r]
 // act_u8: uint8 (= int8 activation + 128 offset)

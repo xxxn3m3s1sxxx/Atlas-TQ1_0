@@ -109,6 +109,11 @@ struct AtlasModel {
     void* mmap_base = nullptr;      // MapViewOfFile base
     void* mmap_handle = nullptr;    // CreateFileMapping handle
     void* mmap_file = nullptr;      // CreateFile handle
+    // Int8 quantized lm_head (per-row symmetric, ~403 MB instead of 1.5 GB fp32)
+    int8_t* lm_head_i8 = nullptr;
+    int32_t* lm_head_offsets = nullptr;  // precomputed 128 * sum(w) per row
+    float* lm_head_scales = nullptr;
+    bool lm_head_quantized = false;
     ~AtlasModel() {
         if (buf_gate) atlas_vfree((uint8_t*)buf_gate);
         if (buf_up) atlas_vfree((uint8_t*)buf_up);
@@ -116,6 +121,9 @@ struct AtlasModel {
         if (buf_act) atlas_vfree((uint8_t*)buf_act);
         if (buf_i8) atlas_vfree((uint8_t*)buf_i8);
         if (buf_out) atlas_vfree((uint8_t*)buf_out);
+        if (lm_head_i8) atlas_vfree((uint8_t*)lm_head_i8);
+        if (lm_head_offsets) atlas_vfree((uint8_t*)lm_head_offsets);
+        if (lm_head_scales) atlas_vfree((uint8_t*)lm_head_scales);
     }
 
     bool is_mapped(const uint8_t* ptr) const {
@@ -1143,6 +1151,140 @@ ATLAS_API void atlas_forward(
     if (n_layers % 2 == 1) {
         memcpy(hidden_states, buf_a, (size_t)B * H * sizeof(float));
     }
+}
+
+// ─── Quantize lm_head from fp16 to per-row symmetric int8 ─────────────
+// Reads the fp16 tensor at idx, quantizes each row to int8, stores in
+// AtlasModel fields. Frees the fp16 data (saves 768 MB).
+// Call after Python has created its fp32 copy (never before step 4 above).
+ATLAS_API void atlas_quantize_lmhead(AtlasModel* m, int idx) {
+    if (!m || idx < 0 || idx >= (int)m->tensors.size()) return;
+    auto& t = m->tensors[idx];
+    if (t.ttype != 2 || t.data == nullptr) return;
+
+    int V = t.row_dim;
+    int H = m->hidden_dim;
+    int64_t n_vals = (int64_t)V * H;
+
+    int8_t* i8 = (int8_t*)atlas_valloc((size_t)n_vals);
+    int32_t* offs = (int32_t*)atlas_valloc((size_t)V * sizeof(int32_t));
+    float* scales = (float*)atlas_valloc((size_t)V * sizeof(float));
+
+    uint16_t* fp16 = (uint16_t*)t.data;
+
+    for (int r = 0; r < V; r++) {
+        float max_abs = 1e-5f;
+        for (int c = 0; c < H; c++) {
+            float v = fp16_to_fp32(fp16[r * H + c]);
+            float av = fabsf(v);
+            if (av > max_abs) max_abs = av;
+        }
+        float inv = max_abs / 127.0f;
+        scales[r] = inv;
+        int32_t row_sum = 0;
+        for (int c = 0; c < H; c++) {
+            float v = fp16_to_fp32(fp16[r * H + c]);
+            int q = (int)(v / inv + 0.5f);
+            if (q < -127) q = -127;
+            if (q > 127) q = 127;
+            i8[r * H + c] = (int8_t)q;
+            row_sum += q;
+        }
+        offs[r] = 128 * row_sum;
+    }
+
+    atlas_vfree(t.data);
+    t.data = nullptr;
+    t.data_size = 0;
+
+    m->lm_head_i8 = i8;
+    m->lm_head_offsets = offs;
+    m->lm_head_scales = scales;
+    m->lm_head_quantized = true;
+
+    float mb = (float)(n_vals + (int64_t)V * 6) / (1024.0f * 1024.0f);
+    printf("[ATLAS] Quantized lm_head: %d × %d = %.1f MB int8\n", V, H, mb);
+}
+
+// ─── GEMV: int8 lm_head × u8 quantized activations ────────────────────
+// Quantizes B hidden-state vectors [B, H] to u8, then computes full vocab
+// dot products with per-row dequant. AVX2 maddubs + offset trick.
+//
+//   out[b][v] = (Σ_h act_u8[b][h] * W_i8[v][h] - offset[v])
+//               * (max_abs_act[b] / 127) * (weight_scale[v])
+//
+// act: [B, H] float32    output: [B, V] float32
+ATLAS_API void atlas_lmhead_gemv(AtlasModel* m, const float* act,
+                                  float* output, int B) {
+    if (!m || !m->lm_head_quantized) return;
+
+    int V = m->vocab_size;
+    int H = m->hidden_dim;
+
+    // Quantize activations to u8
+    uint8_t* act_u8 = (uint8_t*)atlas_valloc((size_t)B * H);
+    float* max_abs = (float*)atlas_valloc((size_t)B * sizeof(float));
+
+    for (int b = 0; b < B; b++) {
+        float ma = 1e-5f;
+        for (int i = 0; i < H; i++) {
+            float v = fabsf(act[b * H + i]);
+            if (v > ma) ma = v;
+        }
+        max_abs[b] = ma;
+        float inv = 127.0f / ma;
+        for (int i = 0; i < H; i++) {
+            int q = (int)(act[b * H + i] * inv + 128.5f);
+            if (q < 0) q = 0;
+            if (q > 255) q = 255;
+            act_u8[b * H + i] = (uint8_t)q;
+        }
+    }
+
+    const int8_t* w = m->lm_head_i8;
+    const int32_t* offs = m->lm_head_offsets;
+    const float* scales = m->lm_head_scales;
+
+    #ifdef _OPENMP
+    #pragma omp parallel for
+    #endif
+    for (int r = 0; r < V; r++) {
+        const int8_t* wr = w + r * H;
+        int32_t off = offs[r];
+        float s = scales[r];
+
+        for (int b = 0; b < B; b++) {
+            const uint8_t* a = act_u8 + b * H;
+            int c = 0;
+            int dot = 0;
+            __m256i acc = _mm256_setzero_si256();
+
+            for (; c + 32 <= H; c += 32) {
+                __m256i au = _mm256_loadu_si256((const __m256i*)(a + c));
+                __m256i wv = _mm256_loadu_si256((const __m256i*)(wr + c));
+                __m256i prod16 = _mm256_maddubs_epi16(au, wv);
+                __m256i prod32 = _mm256_madd_epi16(prod16, _mm256_set1_epi16(1));
+                acc = _mm256_add_epi32(acc, prod32);
+            }
+
+            __m128i lo = _mm256_castsi256_si128(acc);
+            __m128i hi = _mm256_extracti128_si256(acc, 1);
+            __m128i sum128 = _mm_add_epi32(lo, hi);
+            sum128 = _mm_hadd_epi32(sum128, sum128);
+            sum128 = _mm_hadd_epi32(sum128, sum128);
+            dot = _mm_cvtsi128_si32(sum128);
+
+            for (; c < H; c++) {
+                dot += (int)a[c] * (int)wr[c];
+            }
+
+            dot -= off;
+            output[b * V + r] = (float)dot * (max_abs[b] / 127.0f) * s;
+        }
+    }
+
+    atlas_vfree((uint8_t*)act_u8);
+    atlas_vfree((uint8_t*)max_abs);
 }
 
 }  // extern "C"

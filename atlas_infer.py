@@ -59,6 +59,17 @@ dll.atlas_load_cache.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
 dll.atlas_prefetch_int8.restype = None
 dll.atlas_prefetch_int8.argtypes = [ctypes.c_void_p]
 
+dll.atlas_quantize_lmhead.restype = None
+dll.atlas_quantize_lmhead.argtypes = [ctypes.c_void_p, ctypes.c_int]
+
+dll.atlas_lmhead_gemv.restype = None
+dll.atlas_lmhead_gemv.argtypes = [
+    ctypes.c_void_p,
+    ctypes.POINTER(ctypes.c_float),
+    ctypes.POINTER(ctypes.c_float),
+    ctypes.c_int,
+]
+
 dll.atlas_forward.restype = None
 dll.atlas_forward.argtypes = [
     ctypes.c_void_p,                              # model
@@ -155,15 +166,14 @@ class AtlasModel:
         self.k_cache = np.zeros(kvc_size, dtype=np.float16)
         self.v_cache = np.zeros(kvc_size, dtype=np.float16)
 
-        # No warmup needed — C++ lazily converts lm_head to fp32 on first atlas_forward call
-
-        # Pre-convert lm_head to fp32 at load time to avoid 1240ms first-token spike
-        # Adds 1.5 GB persistent RAM but saves ~1.2s warmup on first decode
-        print("[Atlas] Converting lm_head to fp32...")
+        # Quantize lm_head to per-row int8 in C++ (saves ~1.1 GB vs full fp32)
+        # Frees the fp16 data from C++ memory (~768 MB).
+        print("[Atlas] Quantizing lm_head to int8...")
         t0 = time.time()
-        dummy = np.empty((1, self.hidden), dtype=np.float32)
-        self._matmul_f16("lm_head.weight", dummy)
-        print(f"[Atlas] lm_head ready ({time.time()-t0:.1f}s)")
+        idx_lm_head = self.idx.get("lm_head.weight", -1)
+        if idx_lm_head >= 0:
+            dll.atlas_quantize_lmhead(self.model_ptr, idx_lm_head)
+        print(f"[Atlas] lm_head quantized ({time.time()-t0:.1f}s)")
 
 
     def _cache_indices(self):
@@ -331,7 +341,7 @@ class AtlasModel:
         return out
 
     def _matmul_f16(self, name, act):
-        """Float32 activation × cached weight (kept fp16 on init, convert to fp32 lazily for lm_head)."""
+        """Float32 activation × cached weight. Falls back to int8 GEMV for quantized lm_head."""
         if name not in self._f16_cache:
             idx = self.idx.get(name)
             if idx is None: return None
@@ -341,7 +351,8 @@ class AtlasModel:
                 return self._matmul_tq1(*self._load_tq1(name), act)
             sz = ctypes.c_int()
             ptr = dll.atlas_tensor_data(self.model_ptr, idx, sz)
-            # Small tensors (norms) stay as fp16 view. lm_head converts to fp32 for fast matmul.
+            if not ptr:  # tensor consumed (quantized lm_head)
+                return self._lmhead_gemv(act)
             w = np.ctypeslib.as_array(ptr, shape=(sz.value,)).view(np.float16).reshape(rd.value, act.shape[-1])
             if w.shape[0] * w.shape[1] > 100000:  # lm_head: 131072x3072 -> convert to fp32
                 self._f16_cache[name] = np.ascontiguousarray(w, dtype=np.float32)
@@ -426,7 +437,7 @@ class AtlasModel:
             self.n_layers)
 
         h_norm = np.array([self._rmsnorm(h[b], "model.norm.weight") for b in range(n)])
-        output_logits = self._matmul_f16("lm_head.weight", h_norm).reshape(B, seq_len, self.vocab_size)
+        output_logits = self._lmhead_gemv(h_norm).reshape(B, seq_len, self.vocab_size)
         return output_logits
 
     @staticmethod
@@ -493,7 +504,7 @@ class AtlasModel:
                     self._layer_idx_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
                     self.n_layers)
                 h_norm = self._rmsnorm(h.flatten(), "model.norm.weight")
-                current_logits = self._matmul_f16("lm_head.weight", h_norm.reshape(1, -1)).flatten()
+                current_logits = self._lmhead_gemv(h_norm.reshape(1, -1)).flatten()
 
             next_token = self._sample(current_logits, temperature, top_k, top_p)
             output.append(next_token)
@@ -510,6 +521,19 @@ class AtlasModel:
             if idx >= 0:
                 text = text[:idx]
         return text
+
+    def _lmhead_gemv(self, h_norm):
+        """Logits via C++ int8 GEMV (per-row symmetric int8 lm_head + u8 activation)."""
+        orig = h_norm.shape
+        h = h_norm.reshape(-1, self.hidden)
+        B = h.shape[0]
+        out = np.empty(B * self.vocab_size, dtype=np.float32)
+        dll.atlas_lmhead_gemv(
+            self.model_ptr,
+            h.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            B)
+        return out.reshape(*orig[:-1], self.vocab_size)
 
     def _get_embedding(self, token_id):
         return self._embed_w[token_id].astype(np.float32).reshape(1, self.hidden)
