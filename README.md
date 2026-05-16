@@ -218,7 +218,7 @@ TQ1 packing rounds dimensions up to multiples of 5: a projection with `inter_dim
 
 **Reproducer**: `inter_dim % 5 != 0` triggers the overflow.
 
-### Bug 8: Int8 cache corruption (five root causes) [FIXED]
+### Bug 8 [FIXED]: Int8 cache corruption (five root causes)
 
 The `.i8` mmap cache introduced in v1.0.1 had five independent defects that caused silent data corruption on cached loads:
 
@@ -242,7 +242,7 @@ C++ layer loop fusion uses a ping-pong buffer (`buf_a` ↔ `buf_b`) to avoid per
 
 **Symptoms**: Per-layer profiling showed equal input and output — `forward_layer` was a no-op. Only caught when cross-checking fused vs per-layer output.
 
-### Bug 10: KV cache pointer mismatch in forward_layer (v1.0.2) [FIXED]
+### Bug 10 [FIXED]: KV cache pointer mismatch in forward_layer (v1.0.2)
 
 `forward_layer()` calls `atlas_forward` with `n_layers=1` and a single layer's tensor indices, but passes the full K/V cache pointers. The C++ loop address cache as `k_cache + L * nKV * max_seq * head_dim` where L starts at 0, so it always used **layer 0's** cache region regardless of which layer was being executed. All per-layer decode steps overwrote the same cache entries, producing garbage.
 
