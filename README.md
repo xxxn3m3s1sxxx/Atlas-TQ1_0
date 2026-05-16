@@ -232,7 +232,7 @@ The `.i8` mmap cache introduced in v1.0.1 had five independent defects that caus
 
 5. **Short fwrite on 70 MB+ tensors**: `fwrite(data, 1, 70e6, f)` on Windows wrote fewer bytes than requested (returned ~65k, no error). Subsequent cache reads hit truncated tensor data. **Fix**: Wrap `fwrite` in a loop — write in 64 KB chunks, check return, retry on short writes.
 
-### Bug 9: Ping-pong buffer off-by-one (v1.0.2)
+### Bug 9 [FIXED]: Ping-pong buffer off-by-one (v1.0.2)
 
 C++ layer loop fusion uses a ping-pong buffer (`buf_a` ↔ `buf_b`) to avoid per-layer copies. The `forward_layer()` helper runs `n_layers=1` (odd). After the swap at the end of each layer, the internal loop swapped `buf_a` ↔ `buf_b`. For odd `n_layers`, the final output was left in `buf_a`, but the epilogue copied from `buf_b` (the *input*), returning the *previous* layer's output unchanged.
 
