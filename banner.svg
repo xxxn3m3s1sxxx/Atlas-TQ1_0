@@ -1,0 +1,92 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 320" width="100%" height="100%">
+  <defs>
+    <linearGradient id="phoenixGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#8a5cf6" stop-opacity="0.9"/>
+      <stop offset="50%" stop-color="#6d28d9" stop-opacity="1"/>
+      <stop offset="100%" stop-color="#4c1d95" stop-opacity="0.9"/>
+    </linearGradient>
+    <linearGradient id="glowGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#c084fc" stop-opacity="0.6"/>
+      <stop offset="100%" stop-color="#6d28d9" stop-opacity="0"/>
+    </linearGradient>
+    <pattern id="circuitGrid" width="60" height="30" patternUnits="userSpaceOnUse">
+      <path d="M 60 0 L 0 0 0 30" fill="none" stroke="#1e1b4b" stroke-width="0.8"/>
+      <circle cx="0" cy="0" r="1.5" fill="#4c1d95" opacity="0.4"/>
+    </pattern>
+  </defs>
+
+  <rect width="1200" height="320" fill="#090514"/>
+  <rect width="1200" height="320" fill="url(#circuitGrid)"/>
+
+  <rect x="0" y="0" width="8" height="320" fill="url(#phoenixGrad)"/>
+  <path d="M 8 0 L 120 320 L 8 320 Z" fill="url(#glowGrad)" opacity="0.15"/>
+
+  <g transform="translate(920, -20)" opacity="0.06" fill="#ffffff" font-family="monospace" font-size="28" font-weight="bold">
+    <text x="0" y="60">[ +1 ]</text> <text x="120" y="60">[  0 ]</text> <text x="240" y="60">[ -1 ]</text>
+    <text x="40" y="120">[ -1 ]</text> <text x="160" y="120">[ +1 ]</text> <text x="280" y="120">[  0 ]</text>
+    <text x="10" y="180">[  0 ]</text> <text x="130" y="180">[ -1 ]</text> <text x="250" y="180">[ +1 ]</text>
+    <text x="70" y="240">[ +1 ]</text> <text x="190" y="240">[  0 ]</text> <text x="310" y="240">[ -1 ]</text>
+    <text x="30" y="300">[ -1 ]</text> <text x="150" y="300">[ +1 ]</text> <text x="270" y="300">[  0 ]</text>
+  </g>
+
+  <g transform="translate(60, 140)">
+    <text x="0" y="0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="76" font-weight="900" fill="#ffffff" letter-spacing="4">
+      ATLAS
+    </text>
+    
+    <rect x="290" y="-60" width="95" height="30" rx="6" fill="#1e1b4b" stroke="#6d28d9" stroke-width="1.5"/>
+    <text x="337" y="-40" font-family="monospace" font-size="14" font-weight="bold" fill="#c084fc" text-anchor="middle">
+      v1.0.2
+    </text>
+
+    <text x="0" y="42" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="24" font-weight="400" fill="#94a3b8" letter-spacing="0.5">
+      Ternary Inference Engine for <tspan fill="#c084fc" font-weight="600">BitNet b1.58</tspan> Models
+    </text>
+  </g>
+
+  <g transform="translate(680, 75)" font-family="monospace" font-size="15" fill="#cbd5e1">
+    <g transform="translate(0, 0)">
+      <rect x="0" y="0" width="24" height="24" rx="4" fill="#2e1065" stroke="#6d28d9" stroke-width="1"/>
+      <path d="M 6 12 L 10 16 L 18 7" fill="none" stroke="#a78bfa" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+      <text x="40" y="17" font-weight="bold" fill="#ffffff">Architecture:</text>
+      <text x="165" y="17" fill="#94a3b8">Pure CPU Int8 AVX2 Matmuls</text>
+    </g>
+
+    <g transform="translate(0, 40)">
+      <rect x="0" y="0" width="24" height="24" rx="4" fill="#2e1065" stroke="#6d28d9" stroke-width="1"/>
+      <path d="M 6 12 L 10 16 L 18 7" fill="none" stroke="#a78bfa" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+      <text x="40" y="17" font-weight="bold" fill="#ffffff">Format:</text>
+      <text x="110" y="17" fill="#94a3b8">TQ1.0 (5 Ternary Trits packed/byte)</text>
+    </g>
+
+    <g transform="translate(0, 80)">
+      <rect x="0" y="0" width="24" height="24" rx="4" fill="#2e1065" stroke="#6d28d9" stroke-width="1"/>
+      <path d="M 6 12 L 10 16 L 18 7" fill="none" stroke="#a78bfa" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+      <text x="40" y="17" font-weight="bold" fill="#ffffff">Hardware:</text>
+      <text x="130" y="17" fill="#a78bfa" font-weight="bold">8 GB RAM Optimized</text>
+      <text x="285" y="17" fill="#64748b">(Falcon3 1B &amp; 3B)</text>
+    </g>
+
+    <g transform="translate(0, 120)">
+      <rect x="0" y="0" width="24" height="24" rx="4" fill="#2e1065" stroke="#6d28d9" stroke-width="1"/>
+      <path d="M 6 12 L 10 16 L 18 7" fill="none" stroke="#a78bfa" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+      <text x="40" y="17" font-weight="bold" fill="#ffffff">Platforms:</text>
+      <text x="140" y="17" fill="#94a3b8">Windows (Clang) + Linux (GCC/Clang)</text>
+    </g>
+
+    <g transform="translate(0, 165)">
+      <rect x="0" y="0" width="24" height="24" rx="4" fill="#1e152a" stroke="#4c1d95" stroke-width="1"/>
+      <text x="6" y="17" fill="#c084fc" font-weight="bold">⚙️</text>
+      <text x="40" y="17" font-weight="bold" fill="#c084fc">Current Sprint:</text>
+      <text x="180" y="17" fill="#a78bfa">Linux x86-64 Port Deployment</text>
+    </g>
+  </g>
+
+  <line x1="60" y1="285" x2="1140" y2="285" stroke="#1e1b4b" stroke-width="1.5"/>
+
+  <g transform="translate(60, 304)" font-family="monospace" font-size="12" fill="#4c1d95">
+    <text x="0" y="0" font-weight="bold">TARGET: CORE-X HARDWARE LAYER</text>
+    <text x="400" y="0" text-anchor="middle" fill="#64748b">Apache-2.0 License • Microsoft Research BitNet b1.58</text>
+    <text x="1080" y="0" text-anchor="end" fill="#8a5cf6">KERNEL: FUSED C++ LAYER LNF</text>
+  </g>
+</svg>
