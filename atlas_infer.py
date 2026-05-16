@@ -8,7 +8,8 @@ from transformers import AutoTokenizer
 # Resolve OpenMP runtime conflicts (numpy MKL vs libomp)
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
-_dll_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "atlas.dll")
+_dll_name = "atlas.dll" if sys.platform == "win32" else "libatlas.so"
+_dll_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), _dll_name)
 if not os.path.exists(_dll_path):
     _dll_path = os.environ.get("ATLAS_DLL", _dll_path)
 dll = ctypes.CDLL(_dll_path)
@@ -126,7 +127,7 @@ class AtlasModel:
         self.rope_theta = self._get_rope_theta()
 
         # Build tensor name→index map from safetensors
-        with safe_open(safetensors_path, framework='pt', device='cpu') as f:
+        with safe_open(safetensors_path, framework='np', device='cpu') as f:
             self.tensor_names = list(f.keys())
         self.n_tensors = len(self.tensor_names)
 
@@ -154,8 +155,7 @@ class AtlasModel:
         self.k_cache = np.zeros(kvc_size, dtype=np.float16)
         self.v_cache = np.zeros(kvc_size, dtype=np.float16)
 
-        # Warm LM head cache
-        self._matmul_f16("lm_head.weight", np.random.randn(1, self.hidden).astype(np.float32))
+        # No warmup needed — C++ lazily converts lm_head to fp32 on first atlas_forward call
 
     def _cache_indices(self):
         self.idx = {}
@@ -394,7 +394,7 @@ class AtlasModel:
         return out
 
     def forward(self, tokens, start_pos=0):
-        """Full forward pass — all layers fused into one C++ call."""
+        """Full forward pass — all layers fused in C++, final RMSNorm + LM head in Python."""
         B, seq_len = tokens.shape
         h = self._embed_w[tokens].astype(np.float32)
         h = h.reshape(-1, self.hidden)  # [B*seq_len, H]

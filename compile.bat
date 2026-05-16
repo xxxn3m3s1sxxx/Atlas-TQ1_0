@@ -13,7 +13,7 @@ REM KMP_DUPLICATE_LIB_OK=TRUE automatically to resolve this.
 set CC=clang++
 
 echo [Atlas] Compiling atlas.dll...
-%CC% -shared -o atlas.dll atlas_api.cpp -O2 -mavx2 -mfma -std=c++17 -fopenmp
+%CC% -shared -o atlas.dll atlas_api.cpp -O2 -mavx2 -mfma -mf16c -ffast-math -std=c++17 -fopenmp
 
 if %ERRORLEVEL% EQU 0 (
     echo [Atlas] OK -- atlas.dll built successfully

@@ -1,30 +1,48 @@
 // atlas_api.cpp — C-exported DLL for TQ1.0 inference acceleration
 // atlas_ffi.h is the pure C API contract for FFI consumers (standalone reference)
-#define ATLAS_API __declspec(dllexport)
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <cmath>
 #include <vector>
-#include <malloc.h>
-#include <io.h>
 #include <immintrin.h>
-#include <windows.h>
-
-// VirtualAlloc-based allocator for large tensor data — memory is returned to OS on free
-static uint8_t* valloc(size_t size) {
-    return (uint8_t*)VirtualAlloc(NULL, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-}
-static void vfree(uint8_t* ptr) {
-    if (ptr) VirtualFree(ptr, 0, MEM_RELEASE);
-}
 
 #ifdef _WIN32
+  #define ATLAS_API __declspec(dllexport)
+  #include <malloc.h>
+  #include <io.h>
+  #include <windows.h>
+  // VirtualAlloc returns memory to OS on free — no fragmentation
+  static uint8_t* atlas_valloc(size_t size) {
+      return (uint8_t*)VirtualAlloc(NULL, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+  }
+  static void atlas_vfree(uint8_t* ptr) {
+      if (ptr) VirtualFree(ptr, 0, MEM_RELEASE);
+  }
   #define FSEEK _fseeki64
   #define FTELL _ftelli64
+  #define STRICMP _stricmp
 #else
+  #define ATLAS_API __attribute__((visibility("default")))
+  #include <cstdlib>
+  #include <unistd.h>
+  #include <sys/mman.h>
+  #include <sys/stat.h>
+  #include <fcntl.h>
+  // mmap-based allocator — MAP_POPULATE hints pages into RAM
+  static uint8_t* atlas_valloc(size_t size) {
+      size_t pages = (size + 4095) & ~4095;
+      void* p = mmap(NULL, pages, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
+      if (p == MAP_FAILED) return nullptr;
+      return (uint8_t*)p;
+  }
+  static void atlas_vfree(uint8_t* ptr) {
+      if (ptr) munmap(ptr, 0);  // size=0 is valid: kernel uses vma size
+  }
   #define FSEEK fseeko
   #define FTELL ftello
+  #define STRICMP strcasecmp
 #endif
 
 extern "C" {
@@ -92,38 +110,45 @@ struct AtlasModel {
     void* mmap_handle = nullptr;    // CreateFileMapping handle
     void* mmap_file = nullptr;      // CreateFile handle
     ~AtlasModel() {
-        if (buf_gate) VirtualFree(buf_gate, 0, MEM_RELEASE);
-        if (buf_up) VirtualFree(buf_up, 0, MEM_RELEASE);
-        if (buf_hidden) VirtualFree(buf_hidden, 0, MEM_RELEASE);
-        if (buf_act) VirtualFree(buf_act, 0, MEM_RELEASE);
-        if (buf_i8) VirtualFree(buf_i8, 0, MEM_RELEASE);
-        if (buf_out) VirtualFree(buf_out, 0, MEM_RELEASE);
+        if (buf_gate) atlas_vfree((uint8_t*)buf_gate);
+        if (buf_up) atlas_vfree((uint8_t*)buf_up);
+        if (buf_hidden) atlas_vfree((uint8_t*)buf_hidden);
+        if (buf_act) atlas_vfree((uint8_t*)buf_act);
+        if (buf_i8) atlas_vfree((uint8_t*)buf_i8);
+        if (buf_out) atlas_vfree((uint8_t*)buf_out);
     }
 
     bool is_mapped(const uint8_t* ptr) const {
-        return mmap_base && ptr >= (const uint8_t*)mmap_base &&
-               ptr < (const uint8_t*)mmap_base + 0xFFFFFFFF;  // rough bounds check
+        if (!mmap_base) return false;
+        int64_t mmap_sz;
+#ifdef _WIN32
+        mmap_sz = 0xFFFFFFFF;
+#else
+        mmap_sz = (int64_t)(intptr_t)mmap_handle;
+#endif
+        return ptr >= (const uint8_t*)mmap_base &&
+               ptr < (const uint8_t*)mmap_base + mmap_sz;
     }
 
     void ensure_buffers(int B) {
         if (B <= max_batch) return;
-        if (buf_gate) VirtualFree(buf_gate, 0, MEM_RELEASE);
-        if (buf_up) VirtualFree(buf_up, 0, MEM_RELEASE);
-        if (buf_hidden) VirtualFree(buf_hidden, 0, MEM_RELEASE);
-        if (buf_act) VirtualFree(buf_act, 0, MEM_RELEASE);
-        if (buf_i8) VirtualFree(buf_i8, 0, MEM_RELEASE);
-        if (buf_out) VirtualFree(buf_out, 0, MEM_RELEASE);
+        if (buf_gate) atlas_vfree((uint8_t*)buf_gate);
+        if (buf_up) atlas_vfree((uint8_t*)buf_up);
+        if (buf_hidden) atlas_vfree((uint8_t*)buf_hidden);
+        if (buf_act) atlas_vfree((uint8_t*)buf_act);
+        if (buf_i8) atlas_vfree((uint8_t*)buf_i8);
+        if (buf_out) atlas_vfree((uint8_t*)buf_out);
 
         int max_dim = inter_dim > hidden_dim ? inter_dim : hidden_dim;
         if (n_heads * head_dim > max_dim) max_dim = n_heads * head_dim;
         int max_aligned = ((max_dim + 7) + 31) & ~31;  // +7 for TQ1 padding (packed_cols*5 up to dim+4)
 
-        buf_gate = (float*)VirtualAlloc(NULL, (size_t)B * inter_dim * sizeof(float), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        buf_up = (float*)VirtualAlloc(NULL, (size_t)B * inter_dim * sizeof(float), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        buf_hidden = (float*)VirtualAlloc(NULL, (size_t)B * inter_dim * sizeof(float), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        buf_act = (float*)VirtualAlloc(NULL, (size_t)B * max_aligned * sizeof(float), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        buf_i8 = (uint8_t*)VirtualAlloc(NULL, (size_t)B * max_aligned * sizeof(uint8_t), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        buf_out = (float*)VirtualAlloc(NULL, (size_t)B * hidden_dim * sizeof(float), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        buf_gate = (float*)atlas_valloc((size_t)B * inter_dim * sizeof(float));
+        buf_up = (float*)atlas_valloc((size_t)B * inter_dim * sizeof(float));
+        buf_hidden = (float*)atlas_valloc((size_t)B * inter_dim * sizeof(float));
+        buf_act = (float*)atlas_valloc((size_t)B * max_aligned * sizeof(float));
+        buf_i8 = (uint8_t*)atlas_valloc((size_t)B * max_aligned * sizeof(uint8_t));
+        buf_out = (float*)atlas_valloc((size_t)B * hidden_dim * sizeof(float));
         max_batch = B;
     }
 };
@@ -209,7 +234,7 @@ ATLAS_API AtlasModel* atlas_load(const char* path) {
             t.packed_cols = 0;
         }
 
-        t.data = valloc(t.data_size);
+        t.data = atlas_valloc(t.data_size);
         fread(t.data, 1, t.data_size, f);
     }
 
@@ -225,12 +250,19 @@ ATLAS_API void atlas_free(AtlasModel* m) {
     if (!m) return;
     // Free valloc'd tensors (not mmap'd ones)
     for (auto& t : m->tensors) {
-        if (t.data && !m->is_mapped(t.data)) vfree(t.data);
+        if (t.data && !m->is_mapped(t.data)) atlas_vfree(t.data);
     }
     // Unmap cache if loaded
-    if (m->mmap_base) UnmapViewOfFile(m->mmap_base);
-    if (m->mmap_handle) CloseHandle(m->mmap_handle);
-    if (m->mmap_file) CloseHandle((HANDLE)m->mmap_file);
+    if (m->mmap_base) {
+#ifdef _WIN32
+        UnmapViewOfFile(m->mmap_base);
+        CloseHandle(m->mmap_handle);
+        CloseHandle((HANDLE)m->mmap_file);
+#else
+        munmap(m->mmap_base, 0);
+        close((int)(intptr_t)m->mmap_file);
+#endif
+    }
     delete m;
 }
 
@@ -282,7 +314,7 @@ static void cache_path(const char* atlas_path, char* out, int out_size) {
     int len = (int)strlen(out);
     // Replace .atlas suffix with .i8 (or append .i8 if no .atlas)
     const char* dot = strrchr(out, '.');
-    if (dot && _stricmp(dot, ".atlas") == 0) {
+    if (dot && STRICMP(dot, ".atlas") == 0) {
         int prefix_len = (int)(dot - out);
         out[prefix_len] = '.';
         out[prefix_len+1] = 'i';
@@ -350,19 +382,38 @@ ATLAS_API void atlas_save_cache(AtlasModel* m, const char* atlas_path) {
 
 ATLAS_API int atlas_load_cache(AtlasModel* m, const char* atlas_path) {
     char path[1024]; cache_path(atlas_path, path, sizeof(path));
-    HANDLE hFile = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+    uint8_t* base = nullptr;
+    void* hFile = nullptr;
+    void* hMap = nullptr;
+
+#ifdef _WIN32
+    HANDLE hFileW = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hFile == INVALID_HANDLE_VALUE) return 0;
-
-    HANDLE hMap = CreateFileMappingA(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
-    if (!hMap) { CloseHandle(hFile); return 0; }
-
-    uint8_t* base = (uint8_t*)MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
-    if (!base) { CloseHandle(hMap); CloseHandle(hFile); return 0; }
+    if (hFileW == INVALID_HANDLE_VALUE) return 0;
+    HANDLE hMapW = CreateFileMappingA(hFileW, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (!hMapW) { CloseHandle(hFileW); return 0; }
+    base = (uint8_t*)MapViewOfFile(hMapW, FILE_MAP_READ, 0, 0, 0);
+    if (!base) { CloseHandle(hMapW); CloseHandle(hFileW); return 0; }
+    hFile = (void*)hFileW;
+    hMap = (void*)hMapW;
+#else
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    off_t fsize = lseek(fd, 0, SEEK_END);
+    if (fsize <= 0) { close(fd); return 0; }
+    base = (uint8_t*)mmap(NULL, fsize, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (base == MAP_FAILED) { close(fd); return 0; }
+    hFile = (void*)(intptr_t)fd;
+    hMap = (void*)(intptr_t)fsize;
+#endif
 
     int n = *(int*)base;
     if (n != (int)m->tensors.size()) {
-        UnmapViewOfFile(base); CloseHandle(hMap); CloseHandle(hFile);
+#ifdef _WIN32
+        UnmapViewOfFile(base); CloseHandle((HANDLE)hMap); CloseHandle((HANDLE)hFile);
+#else
+        munmap(base, (size_t)(intptr_t)hMap); close((int)(intptr_t)hFile);
+#endif
         return 0;
     }
 
@@ -380,7 +431,7 @@ ATLAS_API int atlas_load_cache(AtlasModel* m, const char* atlas_path) {
 
         auto& t = m->tensors[i];
         if (t.ttype == 0 && cttype == 3 && ds > 0 && off >= 0) {
-            if (t.data) vfree(t.data);
+            if (t.data) atlas_vfree(t.data);
             t.ttype = 3;
             t.row_dim = row_dim;
             t.packed_cols = cpc;
@@ -411,7 +462,7 @@ ATLAS_API void atlas_decompress_all(AtlasModel* m) {
         int n_vals = t.row_dim * input_dim;
 
         // Allocate: [scale_fp16(2)] [i8_data(rows × input_dim)] [row_sums(rows × 4)]
-        uint8_t* new_data = valloc(2 + n_vals + t.row_dim * 4);
+        uint8_t* new_data = atlas_valloc(2 + n_vals + t.row_dim * 4);
         new_data[0] = t.data[0];
         new_data[1] = t.data[1];
 
@@ -434,7 +485,7 @@ ATLAS_API void atlas_decompress_all(AtlasModel* m) {
         }
 
         // Free packed data, replace with int8
-        vfree(t.data);
+        atlas_vfree(t.data);
         t.data = new_data;
         t.data_size = 2 + n_vals + t.row_dim * 4;
         t.ttype = 3;  // int8-decoded
@@ -1087,9 +1138,10 @@ ATLAS_API void atlas_forward(
         float* tmp = buf_a; buf_a = buf_b; buf_b = tmp;
     }
 
-    // If odd number of layers, final output is in buf_b (not hidden_states)
+    // If odd number of layers, final output is in buf_a after the last swap,
+    // not in hidden_states. Copy it back.
     if (n_layers % 2 == 1) {
-        memcpy(hidden_states, buf_b, (size_t)B * H * sizeof(float));
+        memcpy(hidden_states, buf_a, (size_t)B * H * sizeof(float));
     }
 }
 

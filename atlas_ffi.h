@@ -1,5 +1,5 @@
 // atlas_ffi.h — Pure C API contract for ATLAS TQ1.0 inference engine
-// v1.0.1 — Single source of truth for FFI consumers (Mojo, Rust, Zig, Go, C)
+// v1.0.2 — Single source of truth for FFI consumers (Mojo, Rust, Zig, Go, C)
 //
 // File format: ATLAS TQ1.0 (.atlas)
 //   [0:5]   "ATLAS" magic
@@ -110,15 +110,16 @@ ATLAS_API const int8_t* atlas_get_int8(void* model, int idx, int* rows,
                                         const int32_t** row_sums);
 
 // ─── Inference ────────────────────────────────────────────────────────
-// Forward ALL transformer layers in one call (fused C++ loop).
-// hidden_states: [B × hidden_dim] float32 — read from, overwritten with final output
+// Forward ALL transformer layers (RMSNorm + QKV + attention + FFN), fused.
+// hidden_states: [B × hidden_dim] float32 — read from, overwritten with final layer output
 // positions: [B] int32 — absolute position indices for RoPE
 // layer_idx: [n_layers × 9] int32 — flat tensor indices per layer:
 //   (ln1, q, k, v, o, ln2, gate, up, down) repeated for each layer
 // k_cache, v_cache: [n_layers × n_kv_heads × max_seq_len × head_dim] uint16 (fp16)
 // seq_now: current sequence length (positions will be < seq_now for decode)
 //
-// Memory: buffers allocated internally via ensure_buffers (VirtualAlloc).
+// Final RMSNorm + LM head matmul should be applied in Python (numpy/MKL is faster).
+// Memory: buffers allocated internally via valloc (mmap/VirtualAlloc).
 //   ~4 × B × max(inter_dim, hidden_dim, n_heads*head_dim) × sizeof(float)
 ATLAS_API void atlas_forward(void* model,
     float* hidden_states, int B,
