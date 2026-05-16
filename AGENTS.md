@@ -37,15 +37,30 @@
 - README paths fixed to relative/portable.
 - `atlas_*.dll` temp builds gitignored.
 
+### Done (latest)
+- **VirtualAlloc fix**: CRT `new`/`delete` doesn't return freed packed data (3.35GB) to the OS → total ~16.35GB > 16GB → page thrashing during prefill (10.8s). Switched tensor data to `VirtualAlloc`/`VirtualFree` so memory is returned to OS on delete. Prefill: 10.8s → 2.97s (3.6×).
+- **fp16 embedding cache**: Embed weight kept as fp16 (1.6GB vs 3.2GB float32), converted on lookup → saves 1.6GB RAM. Decode: 1.4→1.6 tok/s from reduced memory pressure.
+- **`_rmsnorm` fix — two bugs found and fixed**:
+  1. `ctypes.create_string_buffer()` truncates fp16 data at first NULL byte (`\x00`). fp16 `1.0` = `\x00\x3C`, so RMSNorm weights truncated → zeroed most outputs. Fixed by caching DLL raw `ctypes.POINTER(c_uint8)` directly instead of `tobytes()` → `create_string_buffer`.
+  2. `len(x)` returns 1 for 2D array `(1, 3072)`. Changed to `x.shape[-1]`.
+- **C++ forward_layer verified corr > 0.99** for all 40 layers end-to-end against Python reference.
+- `generate("What is 2+2?")` → `"2+2=4"` (correct). `"Hello"` → `"Hello! How can I assist you today?"` (correct).
+- **KV swap bug fixed** earlier: K was written to buf_hidden but read from buf_up; V vice versa.
+- **seq_now bug in test**: original `test_layer0.py` 40-layer test used `seq_now=L+1` (ranges 1..40) instead of `seq_now=1` for single-token test. Causal mask masks extra positions so results are identical, but test was also affected by `_rmsnorm` bugs.
+- **Snap buffer overflow fixed**: `snap_q/k/v/o/norm1` allocated with initial B only, not resized on batch increase. Prefill (B=12) after decode warmup (B=1) wrote past end, causing access violation. Fixed by resizing snap buffers in `ensure_buffers`.
+
 ### Open
-- **Prefill is slow**: 15s for 18-token prompt (includes load-time decompression of all layers). Prefill matmul batching (seq=6 → 33ms vs seq=1 → 19ms) limits improvement.
-- **Memory**: 16GB RAM tight. Int8 weights ~9.5GB + KVCache 0.34GB + Python 1GB + Windows 3-4GB ≈ 14-15GB total.
+- **Prefill matmul scaling**: seq=18 → ~75ms/layer, seq=1 → ~19ms. The 4× batch scaling gives only 1.3× slowdown vs 4× ideal — limited by memory bandwidth, not compute.
+- **Memory**: After VirtualAlloc fix + fp16 embed: int8 9.5GB + KVCache 0.34GB + embed fp16 1.6GB + Python ~0.5GB ≈ 11.9GB (was ~14.5GB). Fits comfortably in 16GB.
+- **head_dim=256** (not 128): Falcon3-10B config has `head_dim=256`, so Q output = 12×256 = 3072 = hidden_dim. AGENTS.md said 128 before — corrected.
 
 ### Blocked
 - **7B model**: safetensors not present on this machine. GGUF variant exists at `C:\models\Falcon3-7B-Instruct-1.58bit-GGUF` but packer reads safetensors only.
 
 ## Key Decisions
 - **TQ1 decompressed to int8 at C++ load time**: 280 tensors decoded once, packed data freed. Fast `maddubs` SIMD replaces LUT lookups.
+- **VirtualAlloc/VirtualFree for tensor data**: CRT `new`/`delete` doesn't return freed heap pages to OS. Using `VirtualAlloc`/`VirtualFree` ensures 3.35GB packed data is released after decompress, avoiding page thrashing.
+- **fp16 embed cache**: Embed weight kept as fp16 (not converted to fp32), saves 1.6GB RAM at cost of tiny conversion overhead per token.
 - **Per-tensor int8 cache in C++** (via `atlas_get_int8`): Python creates zero-copy numpy views into DLL memory.
 - **Scalar over AVX2 gather**: Gather was 4× slower (40 vs 162 tok/s) on Alder Lake.
 - **Dynamic OpenMP**: `libomp.dll` at runtime (no static libomp.a in LLVM-MinGW).

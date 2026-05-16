@@ -49,6 +49,24 @@ dll.atlas_matmul_i8_f32.argtypes = [ctypes.c_int, ctypes.c_int,
 dll.atlas_decompress_all.restype = None
 dll.atlas_decompress_all.argtypes = [ctypes.c_void_p]
 
+dll.atlas_prefetch_int8.restype = None
+dll.atlas_prefetch_int8.argtypes = [ctypes.c_void_p]
+
+dll.atlas_forward_layer.restype = None
+dll.atlas_forward_layer.argtypes = [
+    ctypes.c_void_p,                              # model
+    ctypes.POINTER(ctypes.c_float),               # input
+    ctypes.POINTER(ctypes.c_float),               # output
+    ctypes.c_int,                                  # B
+    ctypes.POINTER(ctypes.c_int),                  # positions
+    ctypes.POINTER(ctypes.c_uint16),               # k_cache
+    ctypes.POINTER(ctypes.c_uint16),               # v_cache
+    ctypes.c_int,                                  # max_seq_len
+    ctypes.c_int,                                  # seq_now
+    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+]
+
 dll.atlas_get_int8.restype = ctypes.POINTER(ctypes.c_int8)
 dll.atlas_get_int8.argtypes = [ctypes.c_void_p, ctypes.c_int,
     ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
@@ -118,6 +136,9 @@ class AtlasModel:
         dll.atlas_decompress_all(self.model_ptr)
         print("[Atlas] TQ1 tensors decoded to int8")
 
+        # Prefetch int8 data into physical RAM (no page faults during inference)
+        dll.atlas_prefetch_int8(self.model_ptr)
+
         # Precompute KV cache
         self.max_seq_len = 4096  # conservative for 16GB
         kvc_size = (self.n_layers, self.n_kv_heads, self.max_seq_len, self.head_dim)
@@ -132,9 +153,7 @@ class AtlasModel:
         for i, name in enumerate(self.tensor_names):
             self.idx[name] = i
         # Cache frequently-used tensors
-        self._embed_w = self._load_weight_f16(
-            "model.embed_tokens.weight",
-            shape=(self.vocab_size, self.hidden))
+        self._embed_w = self._load_embed("model.embed_tokens.weight")
         self._norm_w = self._load_weight_f16("model.norm.weight")
         self._tq1_cache = {}
         self._f16_cache = {}
@@ -156,6 +175,16 @@ class AtlasModel:
         if shape:
             arr = arr.reshape(shape)
         return arr.copy().astype(np.float32)
+
+    def _load_embed(self, name):
+        """Load embedding as fp16 (not fp32) to save 1.6GB RAM."""
+        idx = self.idx.get(name)
+        if idx is None: return None
+        sz = ctypes.c_int()
+        ptr = dll.atlas_tensor_data(self.model_ptr, idx, sz)
+        if not ptr: return None
+        flat = np.ctypeslib.as_array(ptr, shape=(sz.value,)).view(np.float16).copy()
+        return flat.reshape(self.vocab_size, self.hidden)
 
     def _load_tq1(self, name):
         """Load TQ1 packed data and scale for a weight tensor. Cached."""
@@ -299,14 +328,13 @@ class AtlasModel:
             sz = ctypes.c_int()
             ptr = dll.atlas_tensor_data(self.model_ptr, idx, sz)
             if not ptr: return x
-            raw = np.ctypeslib.as_array(ptr, shape=(sz.value,))
-            self._f16_cache[weight_name] = raw.tobytes()
+            self._f16_cache[weight_name] = ptr
         out = np.zeros_like(x)
         dll.atlas_rmsnorm_f32(
             x.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-            ctypes.cast(ctypes.create_string_buffer(self._f16_cache[weight_name]), ctypes.POINTER(ctypes.c_uint8)),
+            self._f16_cache[weight_name],
             out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-            len(x), ctypes.c_float(eps))
+            x.shape[-1], ctypes.c_float(eps))
         return out
 
     def _apply_rope(self, q, k, position):
@@ -321,67 +349,38 @@ class AtlasModel:
         return x * (1.0 / (1.0 + np.exp(-x)))
 
     def forward_layer(self, x, layer_idx, positions, use_kvcache=True):
-        """Forward one transformer layer for batch of positions."""
+        """Forward one transformer layer — calls C++ implementation."""
         B = len(positions)
         prefix = f"model.layers.{layer_idx}"
-
-        # Pre-attention RMSNorm
-        x_norm = np.zeros((B, self.hidden), dtype=np.float32)
-        for b in range(B):
-            x_norm[b] = self._rmsnorm(x[b], f"{prefix}.input_layernorm.weight")
-
-        # QKV projections (int8)
-        def _mi(name, act):
-            d = self._load_int8(name)
-            return self._matmul_int8(*d, act) if d[0] is not None else None
-        q = _mi(f"{prefix}.self_attn.q_proj.weight", x_norm)
-        k = _mi(f"{prefix}.self_attn.k_proj.weight", x_norm)
-        v = _mi(f"{prefix}.self_attn.v_proj.weight", x_norm)
-
-        # Fused RoPE + GQA attention + causal mask + softmax + weighted sum
-        attn_out = np.zeros((B, self.hidden), dtype=np.float32)
         seq_now = max(positions) + 1 if use_kvcache else B
-        # k/v_cache: [n_kv_heads, max_seq, head_dim] — pass raw uint16 pointers
-        kp = self.k_cache[layer_idx].ctypes.data_as(ctypes.POINTER(ctypes.c_uint16))
-        vp = self.v_cache[layer_idx].ctypes.data_as(ctypes.POINTER(ctypes.c_uint16))
-        dll.atlas_attention_f32(
-            q.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-            k.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-            v.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+
+        # C++ forward_layer needs separate input/output buffers (residual reads input after RMSNorm)
+        out = np.empty_like(x)
+        idx = lambda name: self.idx[name]
+        dll.atlas_forward_layer(
+            self.model_ptr,
+            x.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            B,
             (ctypes.c_int * B)(*positions),
-            kp, vp,
-            self.max_seq_len, seq_now, B,
-            self.n_heads, self.n_kv_heads, self.head_dim,
-            ctypes.c_float(self.rope_theta),
-            attn_out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)))
-
-        # Output projection (int8)
-        o8 = self._load_int8(f"{prefix}.self_attn.o_proj.weight")
-        if o8[0] is not None:
-            attn_out = self._matmul_int8(*o8, attn_out)
-        x = x + attn_out
-
-        # Post-attention RMSNorm
-        x_norm2 = np.zeros((B, self.hidden), dtype=np.float32)
-        for b in range(B):
-            x_norm2[b] = self._rmsnorm(x[b], f"{prefix}.post_attention_layernorm.weight")
-
-        # FFN: SiLU(gate) * up → down (int8)
-        def _mi2(name, act):
-            d = self._load_int8(name)
-            return self._matmul_int8(*d, act) if d[0] is not None else None
-        gate = _mi2(f"{prefix}.mlp.gate_proj.weight", x_norm2)
-        up = _mi2(f"{prefix}.mlp.up_proj.weight", x_norm2)
-        hidden = self._silu(gate) * up
-        down = _mi2(f"{prefix}.mlp.down_proj.weight", hidden)
-        x = x + down
-
-        return x
+            self.k_cache[layer_idx].ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
+            self.v_cache[layer_idx].ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
+            self.max_seq_len, seq_now,
+            idx(f"{prefix}.input_layernorm.weight"),
+            idx(f"{prefix}.self_attn.q_proj.weight"),
+            idx(f"{prefix}.self_attn.k_proj.weight"),
+            idx(f"{prefix}.self_attn.v_proj.weight"),
+            idx(f"{prefix}.self_attn.o_proj.weight"),
+            idx(f"{prefix}.post_attention_layernorm.weight"),
+            idx(f"{prefix}.mlp.gate_proj.weight"),
+            idx(f"{prefix}.mlp.up_proj.weight"),
+            idx(f"{prefix}.mlp.down_proj.weight"))
+        return out
 
     def forward(self, tokens, start_pos=0):
         """Full forward pass for a batch of tokens (prefill)."""
         B, seq_len = tokens.shape
-        h = self._embed_w[tokens]
+        h = self._embed_w[tokens].astype(np.float32)
 
         for layer in range(self.n_layers):
             t0 = time.time()
@@ -469,7 +468,7 @@ class AtlasModel:
         return text
 
     def _get_embedding(self, token_id):
-        return self._embed_w[token_id].reshape(1, self.hidden)
+        return self._embed_w[token_id].astype(np.float32).reshape(1, self.hidden)
 
 
 if __name__ == '__main__':
