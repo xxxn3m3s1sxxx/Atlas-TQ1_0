@@ -11,10 +11,13 @@ BitNet b1.58 models replace full-precision weights with ternary values (-1, 0, +
 | Model | File | Atlas Size | Layers | Hidden | Intermediate | Heads | KV Heads |
 |-------|------|-----------|--------|--------|-------------|-------|----------|
 | Falcon3-1B-Instruct-1.58bit | `falcon3-1b-tq1_0.atlas` | 1.21 GB | 18 | 2048 | 8192 | 8 | 4 |
+| Falcon3-3B-Instruct-1.58bit | `falcon3-3b-tq1_0.atlas` | 1.95 GB | 22 | 3072 | 9216 | 12 | 4 |
 | Falcon3-7B-Instruct-1.58bit | `falcon3-7b-tq1_0.atlas` | 2.74 GB | 28 | 3072 | 23040 | 12 | 4 |
 | Falcon3-10B-Instruct-1.58bit | `falcon3-10b-tq1_0.atlas` | 3.27 GB | 40 | 3072 | 23040 | 12 | 4 |
 
 All use `head_dim=256`, `rope_theta=1000042`, `vocab_size=131072`, GQA architecture. The .atlas extension identifies the file as loadable by the ATLAS engine; the tq1_0 suffix indicates TQ1.0 format version 0 (Base-3, 5 trits/byte).
+
+1B and 3B models fit comfortably in **8 GB RAM** (see Memory table). The 3B offers the best quality-to-speed ratio for memory-constrained systems.
 
 ## Quick Start
 
@@ -92,6 +95,7 @@ Measured on i5-1235U (Alder Lake, 2P+8E, 8 OMP threads, AVX2+FMA, 16 GB DDR4).
 | Model | Prefill (12 tok) | Decode (per token) | Per-Layer C++ |
 |-------|------------------|-------------------|---------------|
 | Falcon3-1B (18L, 2048×8192)  | 0.4 s (26.7 tok/s) | 113 ms (8.9 tok/s) | 3.5 ms mean |
+| Falcon3-3B (22L, 3072×9216)  | 0.6 s (20.4 tok/s) | 203 ms (4.9 tok/s) | 5.2 ms mean |
 | Falcon3-7B (28L, 3072×23040) | 1.2 s (10.0 tok/s) | 417 ms (2.4 tok/s) | 13.7 ms mean |
 | Falcon3-10B (40L, 3072×23040) | 2.7 s (4.5 tok/s) | 641 ms (1.6 tok/s) | 15 ms mean |
 
@@ -99,7 +103,9 @@ Measured on i5-1235U (Alder Lake, 2P+8E, 8 OMP threads, AVX2+FMA, 16 GB DDR4).
 
 **Falcon3-10B**: Per-layer C++ forward ~15 ms (RMSNorm + 7× int8 matmul + fused attention + SiLU FFN), Python overhead ~41 ms (cache indexing, ctypes marshalling, sampling). Layer-0 decode after cold load ~397 ms (page faults on 6.6 GB int8 data), subsequent layers ~12 ms warm.
 
-**Falcon3-7B**: Identical architecture to 10B with 28 layers instead of 40. Faster decode due to 30% fewer matmuls per token. Python overhead dominates at small sizes.
+**Falcon3-7B**: Identical architecture to 10B with 28 layers instead of 40. Faster decode due to 30% fewer matmuls per token.
+
+**Falcon3-3B**: Same hidden/head dimensions as 7B/10B but narrower FFN (9216 vs 23040) and fewer layers (22). The sweet spot for 8 GB systems: 4.9 tok/s with strong output quality.
 
 **Falcon3-1B**: 18 layers, narrower projections (2048×8192 vs 3072×23040). Matmuls complete in ~2-4 ms each — at this scale Python overhead (~41 ms) dominates total decode time.
 
@@ -109,15 +115,15 @@ The `_mm256_maddubs_epi16` AVX2 dot-product kernel (with +128 offset trick) repl
 
 ### Memory
 
-| Component | 1B | 7B | 10B |
-|-----------|----|----|-----|
-| Int8 weight cache | 0.9 GB | 6.7 GB | 9.5 GB |
-| FP16 embedding cache | 0.5 GB | 1.6 GB | 1.6 GB |
-| KV cache (fp16, seq_len=4096) | 0.15 GB | 0.24 GB | 0.34 GB |
-| Python + overhead | ~0.3 GB | ~0.4 GB | ~0.5 GB |
-| **Total** | **~1.9 GB** | **~8.9 GB** | **~11.9 GB** |
+| Component | 1B | 3B | 7B | 10B |
+|-----------|----|----|----|-----|
+| Int8 weight cache | 0.9 GB | 2.4 GB | 6.7 GB | 9.5 GB |
+| FP16 embedding cache | 0.5 GB | 1.6 GB | 1.6 GB | 1.6 GB |
+| KV cache (fp16, seq_len=4096) | 0.15 GB | 0.18 GB | 0.24 GB | 0.34 GB |
+| Python + overhead | ~0.3 GB | ~0.5 GB | ~0.4 GB | ~0.5 GB |
+| **Total** | **~1.9 GB** | **~4.7 GB** | **~8.9 GB** | **~11.9 GB** |
 
-All three fit in 16 GB RAM. Using `VirtualAlloc`/`VirtualFree` for tensor data ensures packed TQ1 data (1.2-3.3 GB) is freed and returned to the OS after decompression, avoiding page thrashing from CRT `new`/`delete`.
+All four fit in 16 GB RAM. **1B and 3B fit comfortably in 8 GB RAM**, making ATLAS viable on a wider range of hardware. Using `VirtualAlloc`/`VirtualFree` for tensor data ensures packed TQ1 data (1.2-3.3 GB) is freed and returned to the OS after decompression, avoiding page thrashing from CRT `new`/`delete`.
 
 ## Bugfix Chronology
 
@@ -177,7 +183,7 @@ TQ1 packing rounds dimensions up to multiples of 5: a projection with `inter_dim
 
 ### Verification
 
-After all seven fixes, all three Falcon3 models (1B, 7B, 10B) pass full-layer C++ forward verification with correlation > 0.99 end-to-end. The models produce correct text: "What is 2+2?" → "2+2=4" (10B), "Hello" → "Hello! How can I assist you today?" (10B).
+After all seven fixes, all four Falcon3 models (1B, 3B, 7B, 10B) pass full-layer C++ forward verification with correlation > 0.99 end-to-end. The models produce correct text: "What is 2+2?" → "2+2=4" (10B), "Hello" → "Hello! How can I assist you today?" (10B, 3B).
 
 ## File Reference
 
@@ -192,8 +198,9 @@ After all seven fixes, all three Falcon3 models (1B, 7B, 10B) pass full-layer C+
 | `test_layer0.py` | Full multi-layer C++ forward vs Python reference verification |
 | `bench_atlas.py` | Benchmark: load time, per-layer profiling, prefill + decode |
 | `falcon3-10b-tq1_0.atlas` | Falcon3-10B packed (3.27 GB, 643 tensors, 40 layers) |
-| `falcon3-7b-tq1_0.atlas` | Falcon3-7B packed (2.74 GB, 451 tensors, 28 layers) |
-| `falcon3-1b-tq1_0.atlas` | Falcon3-1B packed (1.21 GB, 291 tensors, 18 layers) |
+| `falcon3-7b-tq1_0.atlas`  | Falcon3-7B packed (2.74 GB, 451 tensors, 28 layers) |
+| `falcon3-3b-tq1_0.atlas`  | Falcon3-3B packed (1.95 GB, 355 tensors, 22 layers) |
+| `falcon3-1b-tq1_0.atlas`  | Falcon3-1B packed (1.21 GB, 291 tensors, 18 layers) |
 
 ## License
 
