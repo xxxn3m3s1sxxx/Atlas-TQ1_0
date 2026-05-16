@@ -1,6 +1,10 @@
+<p align="center">
+  <img src="atlas_banner.svg" alt="ATLAS Banner" width="100%">
+</p>
+
 # ATLAS — TQ1.0 Ternary Inference Engine
 
-ATLAS is a CPU-based inference engine for BitNet b1.58 ternary-quantized language models. It repacks HuggingFace safetensors into the **TQ1.0** format (5 ternary trits packed per byte, Base-3 encoded) and runs fast inference through a hybrid C++ DLL + Python pipeline. No GPU required. Runs on an i5 laptop with 16 GB RAM.
+ATLAS is a CPU-based inference engine for BitNet b1.58 ternary-quantized language models. It repacks HuggingFace safetensors into the **TQ1.0** format (5 ternary trits packed per byte, Base-3 encoded) and runs fast inference through a hybrid C++ library + Python pipeline. No GPU required. Runs on an i5 laptop with 16 GB RAM. **Windows + Linux x86-64.**
 
 ## Motivation
 
@@ -23,14 +27,16 @@ All use `head_dim=256`, `rope_theta=1000042`, `vocab_size=131072`, GQA architect
 
 ### Requirements
 
-- Python 3.10+ with `numpy`, `safetensors`, `transformers`, `torch`
-- 16 GB RAM (no GPU)
-- Clang 22.1.5+ (LLVM MinGW) to rebuild the DLL (optional)
-- Windows (originally developed on i5-1235U, portable to Linux with `fseek`/`fseeko` change)
+- Python 3.10+ with `numpy`, `safetensors`, `transformers`
+- 16 GB RAM (no GPU). **1B and 3B models fit in 8 GB RAM.**
+- Windows x86-64 (Clang LLVM-MinGW) **or** Linux x86-64 (GCC/Clang)
+- To rebuild: Clang (Windows) or GCC/Clang (Linux) with OpenMP, AVX2+FMA support
 
 ```
-pip install numpy safetensors transformers torch
+pip install numpy safetensors transformers
 ```
+
+`torch` is only needed if you want to repack from safetensors (the packer can use it for faster tensor ops, but `numpy` fallback works). Inference requires no PyTorch at all.
 
 ### 1. Pack safetensors into ATLAS format
 
@@ -50,47 +56,65 @@ python atlas_infer.py falcon3-10b-tq1_0.atlas path/to/model_dir "What is the cap
 
 The inference script loads the atlas file into the C++ DLL, initializes the tokenizer from the model directory, and runs autoregressive generation with GQA attention, RoPE, KV cache, SiLU FFN, and temperature sampling.
 
-### 3. Compile the DLL (if modifying C++ code)
+### 3. Compile the C++ library (if modifying code)
 
+**Windows:**
 ```bash
 compile.bat
 ```
 
-Requires `clang++` (LLVM MinGW) in PATH. Builds `atlas.dll` with AVX2+FMA and OpenMP.
+Requires `clang++` (LLVM MinGW) in PATH. Builds `atlas.dll` with AVX2+FMA+OpenMP and F16C.
 
-OpenMP is enabled by default. `libomp.dll` must be discoverable at runtime — copy it from `llvm-mingw\x86_64-w64-mingw32\bin\libomp.dll` next to `atlas.dll`, or add that directory to `PATH`.
+**Linux:**
+```bash
+chmod +x compile-linux.sh && ./compile-linux.sh
+```
+
+Builds `libatlas.so` with GCC or Clang (`-fopenmp -mavx2 -mfma -fPIC`).
+
+**Linux dependencies:** If using GCC (`g++`), OpenMP is built-in via `libgomp`. If using Clang (`clang++`), install `libomp-dev`:
+```bash
+# Ubuntu/Debian
+sudo apt install libomp-dev
+# Fedora
+sudo dnf install libomp-devel
+```
+
+OpenMP is enabled by default. On Windows, `libomp.dll` must be discoverable at runtime — copy it from `llvm-mingw\x86_64-w64-mingw32\bin\libomp.dll` next to `atlas.dll`, or add that directory to `PATH`.
 
 **Windows-specific**: The MKL backend that numpy may use loads `libiomp5md.dll`, a different OpenMP runtime. This causes `OMP: Error #15` at import time. `atlas_infer.py` sets `KMP_DUPLICATE_LIB_OK=TRUE` automatically to suppress this. If you see the error despite this, set `KMP_DUPLICATE_LIB_OK=TRUE` in your environment before running.
 
 ## Architecture
 
 ```
-safetensors ──► atlas_packer.py ──► .atlas file ──► atlas_infer.py ──► atlas.dll (C++)
+safetensors ──► atlas_packer.py ──► .atlas file ──► atlas_infer.py ──► atlas.dll / libatlas.so
                                                          │
-                                                    [virtual] forward_layer
+                                                    atlas_forward (fused N layers, C++)
                                                          │
                                               ┌──────────┼──────────┐
-                                          RMSNorm  Attention  FFN(SiLU)
-                                         (C++ inline) (C++)  (7× int8)
+                                          RMSNorm  Attention  FFN(SiLU)   ◄─ all in C++, per layer
+                                         (C++)      (C++)     (7× int8)
+                                                         │
+                                              Final RMSNorm + LM head (Python, numpy)
 ```
 
 ### Pipeline stages
 
 1. **Packer** (`atlas_packer.py`): Reads HuggingFace safetensors with pre-quantized 2-bit packed weights (`byte = v0 + v1*4 + v2*16 + v3*64`). De-interleaves the BitNet row-aware format (4 weight rows per uint8 row). Repacks each row independently into TQ1.0: 5 ternary trits mapped to Base-3 values 0-242, padded with ternary-0 (mapped from value 1) to fill the last byte. FP16 per-tensor scales are stored as 2-byte prefixes.
 
-2. **ATLAS file format**: Binary file with a 64-byte header (magic "ATLAS", layer count, hidden dim, intermediate dim, head counts, vocab size, tensor count). Followed by a directory of 12-byte entries (ttype, file offset, row dim, packed cols). Tensor data follows: TQ1 weights (ttype=0) have a 2-byte FP16 scale prefix followed by packed rows; embeddings/norms (ttype=1) and LM head (ttype=2) are raw FP16.
+2. **ATLAS file format**: Binary file with a 64-byte header (magic "ATLAS", layer count, hidden dim, intermediate dim, head counts, vocab size, tensor count). Followed by a directory of 12-byte entries (ttype, file offset, row dim, packed cols). Tensor data follows: TQ1 weights (ttype=0) have a 2-byte FP16 scale prefix followed by packed rows; embeddings/norms (ttype=1) and LM head (ttype=2) are raw FP16. An optional `.i8` companion file caches decompressed int8 tensors at the same path for sub-second loading on subsequent runs.
 
-3. **DLL** (`atlas_api.cpp`): Loads the atlas file into memory. On load, TQ1 tensors are decompressed from Base-3 packed format to int8 (one VirtualAlloc per tensor, packed data freed). Then `atlas_forward_layer` runs one complete transformer layer — RMSNorm + 7× int8 matmul (Q/K/V/O/gate/up/down) + fused GQA attention (RoPE + cache + causal softmax + weighted sum) + SiLU FFN — in a single C call. No Python round-trips between sub-operations.
+3. **C++ library** (`atlas_api.cpp`, single source for Windows + Linux): Loads the atlas file into memory. On load, TQ1 tensors are decompressed from Base-3 packed format to int8 (one valloc per tensor — `VirtualAlloc` on Windows, `mmap` on Linux — so freed memory returns to the OS immediately). Then `atlas_forward` runs *all* transformer layers in one fused C++ call — RMSNorm + 7× int8 matmul (Q/K/V/O/gate/up/down) + fused GQA attention (RoPE + cache + causal softmax + weighted sum) + SiLU FFN repeated for each layer — with no Python round-trips between layers. A dedicated ping-pong buffer avoids per-layer copies.
 
 4. **Int8 matmul kernel** (`atlas_matmul_i8_f32`): Uses `_mm256_maddubs_epi16` AVX2 dot-product with a +128 offset trick. Weights are stored as signed int8 (decompressed from TQ1 at load). Activations are quantized per-token to uint8 with max-abs scaling. Output rows are deinterleaved from the BitNet 4-row-packed layout back to natural order. OpenMP parallelizes over rows.
 
-5. **Python inference** (`atlas_infer.py`): Coordinates loading, tokenization, and the autoregressive loop. Each layer calls `atlas_forward_layer` in C++. Only the final RMSNorm, LM head matmul, and sampling remain in Python.
-
-All working buffers use `VirtualAlloc`/`VirtualFree` (not CRT `new`/`delete`) so freed memory is returned to the OS immediately — critical for staying within 16 GB RAM on a 3.35 GB model.
+5. **Python inference** (`atlas_infer.py`): Coordinates loading, tokenization, and the autoregressive loop. All transformer layers are fused into a single `atlas_forward` C++ call per forward pass. Only the final RMSNorm, LM head matmul (numpy), and sampling remain in Python. Platform-aware: loads `atlas.dll` on Windows, `libatlas.so` on Linux.
 
 ## Performance
 
 Measured on i5-1235U (Alder Lake, 2P+8E, 8 OMP threads, AVX2+FMA, 16 GB DDR4).
+
+> **Note**: Numbers are from v1.0.1. v1.0.2 fixed a ping-pong off-by-one bug (Bug 9) that affected per-layer `forward_layer()` — the `generate()` path (fused even layers) was always correct. Per-layer decode timings may differ slightly in v1.0.2; numbers marked with * need re-benchmarking.
 
 | Model | Prefill (12 tok) | Decode (per token) | Per-Layer C++ |
 |-------|------------------|-------------------|---------------|
@@ -108,6 +132,15 @@ Measured on i5-1235U (Alder Lake, 2P+8E, 8 OMP threads, AVX2+FMA, 16 GB DDR4).
 **Falcon3-3B**: Same hidden/head dimensions as 7B/10B but narrower FFN (9216 vs 23040) and fewer layers (22). The sweet spot for 8 GB systems: 4.9 tok/s with strong output quality.
 
 **Falcon3-1B**: 18 layers, narrower projections (2048×8192 vs 3072×23040). Matmuls complete in ~2-4 ms each — at this scale Python overhead (~41 ms) dominates total decode time.
+
+### Int8 Mmap Cache
+
+On first load, ATLAS creates a `.i8` companion file next to the `.atlas` file containing the decompressed int8 tensors (only TQ1 weights, not FP16 norms/embeds). Subsequent loads mmap this file directly, skipping decompression entirely:
+
+- **3B**: 11.1s → 3.5s load (3.2×)
+- **10B**: 35.9s → 15.3s load (2.3×)
+
+The cache stores all ttype==3 (int8-decoded) tensors with a header containing tensor type, dimensions, and 64-bit file offsets. 64 KB chunked writes avoid short-write issues on large tensors (>70 MB). The cache is invalidated if the tensor count changes (e.g., model file replaced). Always generated automatically — no user action needed.
 
 ### Int8 Kernel
 
@@ -127,7 +160,7 @@ All four fit in 16 GB RAM. **1B and 3B fit comfortably in 8 GB RAM**, making ATL
 
 ## Bugfix Chronology
 
-Seven critical bugs were discovered and fixed during development. Any one of them would cause the model to produce garbage output (correlation near zero with reference activations) or crash.
+Eight critical bugs were discovered and fixed during development. Any one of them would cause the model to produce garbage output (correlation near zero with reference activations) or crash.
 
 ### Bug 1 [FIXED]: `fseek` 32-bit overflow
 
@@ -181,9 +214,33 @@ TQ1 packing rounds dimensions up to multiples of 5: a projection with `inter_dim
 
 **Reproducer**: `inter_dim % 5 != 0` triggers the overflow.
 
+### Bug 8: Int8 cache corruption (five root causes) [FIXED]
+
+The `.i8` mmap cache introduced in v1.0.1 had five independent defects that caused silent data corruption on cached loads:
+
+1. **Duplicate file offsets**: The seek-back pattern (`FSEEK`→`fwrite` offset→`FSEEK` data) wrote tensor offsets twice at the same file position. The second write overwrote offset entries before they were read, producing incorrect pointers. **Fix**: Precompute all offsets into a `std::vector<int64_t>`, write once.
+
+2. **GQA scale over-read**: GQA scale tensors (ttype=2) have shape like `[4]` but the cache formula computed `data_size = row_dim × hidden_dim × 2` = 4 × 3072 × 2 = 24576 bytes. The actual file data is only ~8 bytes. This over-read 24+ KB into the *next* tensor's data region. **Fix**: Compare file gap against formula size; use the smaller value.
+
+3. **Inflated cache entries**: The cache header stored the inflated `data_size` for GQA scales (same root cause as #2), so even mmap'd reads would use wrong byte counts. **Fix**: Only cache ttype==3 (int8-decoded) tensors at all. GQA scales stay in the atlas file.
+
+4. **Missing prefetch**: After loading from cache, `atlas_prefetch_int8` was skipped. The first forward pass triggered thousands of page faults on cold mmap data. **Fix**: Always call `atlas_prefetch_int8` regardless of cache source.
+
+5. **Short fwrite on 70 MB+ tensors**: `fwrite(data, 1, 70e6, f)` on Windows wrote fewer bytes than requested (returned ~65k, no error). Subsequent cache reads hit truncated tensor data. **Fix**: Wrap `fwrite` in a loop — write in 64 KB chunks, check return, retry on short writes.
+
+### Bug 9: Ping-pong buffer off-by-one (v1.0.2)
+
+C++ layer loop fusion uses a ping-pong buffer (`buf_a` ↔ `buf_b`) to avoid per-layer copies. The `forward_layer()` helper runs `n_layers=1` (odd). After the swap at the end of each layer, the internal loop swapped `buf_a` ↔ `buf_b`. For odd `n_layers`, the final output was left in `buf_a`, but the epilogue copied from `buf_b` (the *input*), returning the *previous* layer's output unchanged.
+
+**Fix**: `memcpy(hidden_states, buf_a, ...)` for odd `n_layers`.
+
+**Impact**: Only affected callers using odd `n_layers` (e.g., per-layer benchmarking). The fused `generate()` path used all layers at once (even counts for all Falcon3 models), which was always correct. Added to chronology because it silently produced incorrect per-layer profile numbers in v1.0.0 and v1.0.1.
+
+**Symptoms**: Per-layer profiling showed equal input and output — `forward_layer` was a no-op. Only caught when cross-checking fused vs per-layer output.
+
 ### Verification
 
-After all seven fixes, all four Falcon3 models (1B, 3B, 7B, 10B) pass full-layer C++ forward verification with correlation > 0.99 end-to-end. The models produce correct text: "What is 2+2?" → "2+2=4" (10B), "Hello" → "Hello! How can I assist you today?" (10B, 3B).
+After all fixes, all four Falcon3 models (1B, 3B, 7B, 10B) pass full-layer C++ forward verification with correlation > 0.99 end-to-end. Models produce coherent text: "What is the capital of France?" → "The capital of France is Paris." (10B), "Say hello" → "Hello! How can I assist you today?" (3B). v1.0.2 confirmed correct on both Windows and WSL (Linux x86-64).
 
 ## File Reference
 
@@ -191,10 +248,12 @@ After all seven fixes, all four Falcon3 models (1B, 3B, 7B, 10B) pass full-layer
 |------|---------|
 | `atlas_packer.py` | Streams safetensors → TQ1 ATLAS file |
 | `atlas_infer.py` | End-to-end inference engine (Python) |
-| `atlas_api.cpp` | C-exported DLL (load, decompress TQ1→int8, forward_layer, int8 matmul, fused attention, norms) |
-| `atlas.dll` | Prebuilt DLL (Clang LLVM-MinGW, 107 KB) |
+| `atlas_api.cpp` | Single-source C++ library (load, decompress TQ1→int8, fused forward, int8 matmul, fused attention, norms). Windows + Linux via `#ifdef _WIN32` |
+| `atlas.dll` | Prebuilt DLL (Clang LLVM-MinGW, 126 KB) |
+| `libatlas.so` | Prebuilt shared library for Linux (39 KB) |
 | `libomp.dll` | OpenMP runtime (968 KB, ships with LLVM-MinGW) |
-| `compile.bat` | DLL build script (`clang++ -fopenmp -O2 -mavx2 -mfma`) |
+| `compile.bat` | Windows build script (`clang++ -fopenmp -O2 -mavx2 -mfma -mf16c -ffast-math`) |
+| `compile-linux.sh` | Linux build script (`g++ -fopenmp -O2 -mavx2 -mfma -fPIC`) |
 | `test_layer0.py` | Full multi-layer C++ forward vs Python reference verification |
 | `bench_atlas.py` | Benchmark: load time, per-layer profiling, prefill + decode |
 | `falcon3-10b-tq1_0.atlas` | Falcon3-10B packed (3.27 GB, 643 tensors, 40 layers) |
