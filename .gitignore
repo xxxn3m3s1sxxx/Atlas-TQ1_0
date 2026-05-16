@@ -41,3 +41,7 @@ atlas_*.dll
 tmp/
 bench_atlas.py
 profile_layer.py
+*.i8
+*.zip
+instrument_prefill.py
+test_layer0.py

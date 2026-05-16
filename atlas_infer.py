@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Atlas Inference Engine — End-to-end Falcon3-7B TQ1.0 generation."""
-import ctypes, struct, os, time, sys, numpy as np
+import ctypes, struct, os, sys, time, numpy as np
 from safetensors import safe_open
 from transformers import AutoTokenizer
 
@@ -49,22 +49,27 @@ dll.atlas_matmul_i8_f32.argtypes = [ctypes.c_int, ctypes.c_int,
 dll.atlas_decompress_all.restype = None
 dll.atlas_decompress_all.argtypes = [ctypes.c_void_p]
 
+dll.atlas_save_cache.restype = None
+dll.atlas_save_cache.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+
+dll.atlas_load_cache.restype = ctypes.c_int
+dll.atlas_load_cache.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+
 dll.atlas_prefetch_int8.restype = None
 dll.atlas_prefetch_int8.argtypes = [ctypes.c_void_p]
 
-dll.atlas_forward_layer.restype = None
-dll.atlas_forward_layer.argtypes = [
+dll.atlas_forward.restype = None
+dll.atlas_forward.argtypes = [
     ctypes.c_void_p,                              # model
-    ctypes.POINTER(ctypes.c_float),               # input
-    ctypes.POINTER(ctypes.c_float),               # output
+    ctypes.POINTER(ctypes.c_float),               # hidden_states (in-place)
     ctypes.c_int,                                  # B
     ctypes.POINTER(ctypes.c_int),                  # positions
-    ctypes.POINTER(ctypes.c_uint16),               # k_cache
-    ctypes.POINTER(ctypes.c_uint16),               # v_cache
+    ctypes.POINTER(ctypes.c_uint16),               # k_cache (flat)
+    ctypes.POINTER(ctypes.c_uint16),               # v_cache (flat)
     ctypes.c_int,                                  # max_seq_len
     ctypes.c_int,                                  # seq_now
-    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+    ctypes.POINTER(ctypes.c_int),                  # layer_idx [n_layers * 9]
+    ctypes.c_int,                                  # n_layers
 ]
 
 dll.atlas_get_int8.restype = ctypes.POINTER(ctypes.c_int8)
@@ -132,11 +137,15 @@ class AtlasModel:
         # Cache tensor indices for fast lookup
         self._cache_indices()
 
-        # Decompress all TQ1 tensors to int8 in C++ (frees packed data)
-        dll.atlas_decompress_all(self.model_ptr)
-        print("[Atlas] TQ1 tensors decoded to int8")
-
-        # Prefetch int8 data into physical RAM (no page faults during inference)
+        # Try loading int8 cache (mmap'd, instant). If not found, decompress + save.
+        cache_loaded = dll.atlas_load_cache(self.model_ptr, self._atlas_path.encode())
+        if cache_loaded:
+            print("[Atlas] Loaded int8 weights from cache (mmap)")
+        else:
+            dll.atlas_decompress_all(self.model_ptr)
+            print("[Atlas] TQ1 tensors decoded to int8")
+            dll.atlas_save_cache(self.model_ptr, self._atlas_path.encode())
+        # Prefetch int8 data into physical RAM (page-in mmap or fresh decompress)
         dll.atlas_prefetch_int8(self.model_ptr)
 
         # Precompute KV cache
@@ -158,6 +167,18 @@ class AtlasModel:
         self._tq1_cache = {}
         self._f16_cache = {}
         self._i8_cache = {}
+        # Build flat index array for atlas_forward (fused C++ layer loop)
+        idx = self.idx
+        per_layer = ['input_layernorm.weight',
+            'self_attn.q_proj.weight', 'self_attn.k_proj.weight',
+            'self_attn.v_proj.weight', 'self_attn.o_proj.weight',
+            'post_attention_layernorm.weight',
+            'mlp.gate_proj.weight', 'mlp.up_proj.weight', 'mlp.down_proj.weight']
+        arrs = []
+        for L in range(self.n_layers):
+            for n in per_layer:
+                arrs.append(idx[f'model.layers.{L}.{n}'])
+        self._layer_idx_arr = np.array(arrs, dtype=np.int32)
 
     def _get_rope_theta(self):
         with open(self._atlas_path, 'rb') as f:
@@ -301,7 +322,7 @@ class AtlasModel:
         return out
 
     def _matmul_f16(self, name, act):
-        """Float32 activation × cached float32 weight (for non-TQ1 tensors like lm_head)."""
+        """Float32 activation × cached weight (kept fp16 on init, convert to fp32 lazily for lm_head)."""
         if name not in self._f16_cache:
             idx = self.idx.get(name)
             if idx is None: return None
@@ -311,8 +332,12 @@ class AtlasModel:
                 return self._matmul_tq1(*self._load_tq1(name), act)
             sz = ctypes.c_int()
             ptr = dll.atlas_tensor_data(self.model_ptr, idx, sz)
-            w_f16 = np.ctypeslib.as_array(ptr, shape=(sz.value,)).view(np.float16)
-            self._f16_cache[name] = w_f16.reshape(rd.value, act.shape[-1]).astype(np.float32)
+            # Small tensors (norms) stay as fp16 view. lm_head converts to fp32 for fast matmul.
+            w = np.ctypeslib.as_array(ptr, shape=(sz.value,)).view(np.float16).reshape(rd.value, act.shape[-1])
+            if w.shape[0] * w.shape[1] > 100000:  # lm_head: 131072x3072 -> convert to fp32
+                self._f16_cache[name] = np.ascontiguousarray(w, dtype=np.float32)
+            else:
+                self._f16_cache[name] = w
         w = self._f16_cache[name]
         if act.ndim == 1:
             return act @ w.T
@@ -349,47 +374,47 @@ class AtlasModel:
         return x * (1.0 / (1.0 + np.exp(-x)))
 
     def forward_layer(self, x, layer_idx, positions, use_kvcache=True):
-        """Forward one transformer layer — calls C++ implementation."""
-        B = len(positions)
-        prefix = f"model.layers.{layer_idx}"
-        seq_now = max(positions) + 1 if use_kvcache else B
+        """Forward one transformer layer via atlas_forward (fused, n_layers=1)."""
+        B = len(positions) if isinstance(positions, (list, np.ndarray)) else positions.shape[0]
+        positions_arr = np.array(positions, dtype=np.int32)
+        seq_now = int(positions_arr.max()) + 1 if use_kvcache else B
 
-        # C++ forward_layer needs separate input/output buffers (residual reads input after RMSNorm)
-        out = np.empty_like(x)
-        idx = lambda name: self.idx[name]
-        dll.atlas_forward_layer(
+        out = x.copy()
+        idx_slice = self._layer_idx_arr[layer_idx * 9 : (layer_idx + 1) * 9].copy()
+        dll.atlas_forward(
             self.model_ptr,
-            x.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
             out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
             B,
-            (ctypes.c_int * B)(*positions),
-            self.k_cache[layer_idx].ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
-            self.v_cache[layer_idx].ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
+            positions_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+            self.k_cache.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
+            self.v_cache.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
             self.max_seq_len, seq_now,
-            idx(f"{prefix}.input_layernorm.weight"),
-            idx(f"{prefix}.self_attn.q_proj.weight"),
-            idx(f"{prefix}.self_attn.k_proj.weight"),
-            idx(f"{prefix}.self_attn.v_proj.weight"),
-            idx(f"{prefix}.self_attn.o_proj.weight"),
-            idx(f"{prefix}.post_attention_layernorm.weight"),
-            idx(f"{prefix}.mlp.gate_proj.weight"),
-            idx(f"{prefix}.mlp.up_proj.weight"),
-            idx(f"{prefix}.mlp.down_proj.weight"))
+            idx_slice.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+            1)
         return out
 
     def forward(self, tokens, start_pos=0):
-        """Full forward pass for a batch of tokens (prefill)."""
+        """Full forward pass — all layers fused into one C++ call."""
         B, seq_len = tokens.shape
         h = self._embed_w[tokens].astype(np.float32)
+        h = h.reshape(-1, self.hidden)  # [B*seq_len, H]
+        n = B * seq_len
 
-        for layer in range(self.n_layers):
-            t0 = time.time()
-            positions = [start_pos + p for b in range(B) for p in range(seq_len)]
-            h = self.forward_layer(h.reshape(-1, self.hidden), layer, positions)
-            h = h.reshape(B, seq_len, self.hidden)
+        positions = np.array([start_pos + p for b in range(B) for p in range(seq_len)], dtype=np.int32)
+        seq_now = start_pos + seq_len
 
-        h_flat = h.reshape(-1, self.hidden)
-        h_norm = np.array([self._rmsnorm(h_flat[b], "model.norm.weight") for b in range(B * seq_len)])
+        dll.atlas_forward(
+            self.model_ptr,
+            h.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            n,
+            positions.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+            self.k_cache.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
+            self.v_cache.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
+            self.max_seq_len, seq_now,
+            self._layer_idx_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+            self.n_layers)
+
+        h_norm = np.array([self._rmsnorm(h[b], "model.norm.weight") for b in range(n)])
         output_logits = self._matmul_f16("lm_head.weight", h_norm).reshape(B, seq_len, self.vocab_size)
         return output_logits
 
@@ -446,8 +471,16 @@ class AtlasModel:
                 current_logits = logits
             else:
                 h = self._get_embedding(next_token)
-                for layer in range(self.n_layers):
-                    h = self.forward_layer(h, layer, [len(input_ids) + step - 1])
+                pos = np.array([len(input_ids) + step - 1], dtype=np.int32)
+                dll.atlas_forward(
+                    self.model_ptr,
+                    h.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                    1, pos.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+                    self.k_cache.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
+                    self.v_cache.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
+                    self.max_seq_len, len(input_ids) + step,
+                    self._layer_idx_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+                    self.n_layers)
                 h_norm = self._rmsnorm(h.flatten(), "model.norm.weight")
                 current_logits = self._matmul_f16("lm_head.weight", h_norm.reshape(1, -1)).flatten()
 

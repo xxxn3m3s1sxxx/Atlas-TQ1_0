@@ -1,4 +1,5 @@
 // atlas_api.cpp — C-exported DLL for TQ1.0 inference acceleration
+// atlas_ffi.h is the pure C API contract for FFI consumers (standalone reference)
 #define ATLAS_API __declspec(dllexport)
 #include <cstdint>
 #include <cstdio>
@@ -84,25 +85,24 @@ struct AtlasModel {
     float* buf_hidden = nullptr;    // [max_batch * inter_dim]
     float* buf_act = nullptr;       // [max_batch * max_dim] quantized f32→i8 scratch
     uint8_t* buf_i8 = nullptr;      // [max_batch * max_dim] uint8 quantized activations
+    float* buf_out = nullptr;       // [max_batch * hidden_dim] layer output ping-pong for atlas_forward
     int max_batch = 0;
-    // Debug snapshots
-    float* snap_q = nullptr;
-    float* snap_k = nullptr;
-    float* snap_v = nullptr;
-    float* snap_o = nullptr;
-    float* snap_norm1 = nullptr;
-
+    // mmap cache handles (for int8 data loaded from .i8 file)
+    void* mmap_base = nullptr;      // MapViewOfFile base
+    void* mmap_handle = nullptr;    // CreateFileMapping handle
+    void* mmap_file = nullptr;      // CreateFile handle
     ~AtlasModel() {
         if (buf_gate) VirtualFree(buf_gate, 0, MEM_RELEASE);
         if (buf_up) VirtualFree(buf_up, 0, MEM_RELEASE);
         if (buf_hidden) VirtualFree(buf_hidden, 0, MEM_RELEASE);
         if (buf_act) VirtualFree(buf_act, 0, MEM_RELEASE);
         if (buf_i8) VirtualFree(buf_i8, 0, MEM_RELEASE);
-        if (snap_q) VirtualFree(snap_q, 0, MEM_RELEASE);
-        if (snap_k) VirtualFree(snap_k, 0, MEM_RELEASE);
-        if (snap_v) VirtualFree(snap_v, 0, MEM_RELEASE);
-        if (snap_o) VirtualFree(snap_o, 0, MEM_RELEASE);
-        if (snap_norm1) VirtualFree(snap_norm1, 0, MEM_RELEASE);
+        if (buf_out) VirtualFree(buf_out, 0, MEM_RELEASE);
+    }
+
+    bool is_mapped(const uint8_t* ptr) const {
+        return mmap_base && ptr >= (const uint8_t*)mmap_base &&
+               ptr < (const uint8_t*)mmap_base + 0xFFFFFFFF;  // rough bounds check
     }
 
     void ensure_buffers(int B) {
@@ -112,6 +112,7 @@ struct AtlasModel {
         if (buf_hidden) VirtualFree(buf_hidden, 0, MEM_RELEASE);
         if (buf_act) VirtualFree(buf_act, 0, MEM_RELEASE);
         if (buf_i8) VirtualFree(buf_i8, 0, MEM_RELEASE);
+        if (buf_out) VirtualFree(buf_out, 0, MEM_RELEASE);
 
         int max_dim = inter_dim > hidden_dim ? inter_dim : hidden_dim;
         if (n_heads * head_dim > max_dim) max_dim = n_heads * head_dim;
@@ -122,12 +123,7 @@ struct AtlasModel {
         buf_hidden = (float*)VirtualAlloc(NULL, (size_t)B * inter_dim * sizeof(float), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         buf_act = (float*)VirtualAlloc(NULL, (size_t)B * max_aligned * sizeof(float), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         buf_i8 = (uint8_t*)VirtualAlloc(NULL, (size_t)B * max_aligned * sizeof(uint8_t), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        auto alloc_snap = [&](float*& ptr) {
-            if (ptr) VirtualFree(ptr, 0, MEM_RELEASE);
-            ptr = (float*)VirtualAlloc(NULL, (size_t)B * hidden_dim * sizeof(float), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        };
-        alloc_snap(snap_q); alloc_snap(snap_k); alloc_snap(snap_v);
-        alloc_snap(snap_o); alloc_snap(snap_norm1);
+        buf_out = (float*)VirtualAlloc(NULL, (size_t)B * hidden_dim * sizeof(float), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         max_batch = B;
     }
 };
@@ -164,14 +160,28 @@ ATLAS_API AtlasModel* atlas_load(const char* path) {
 
     // Read directory
     m->tensors.resize(n_tensors);
+    std::vector<uint32_t> file_offsets(n_tensors);
     FSEEK(f, 64, SEEK_SET);
     for (int i = 0; i < n_tensors; i++) {
         uint8_t e[12]; fread(e, 1, 12, f);
         m->tensors[i].ttype = e[0];
-        uint32_t off; memcpy(&off, e+1, 4); m->tensors[i].file_offset = off;
+        memcpy(&file_offsets[i], e+1, 4); m->tensors[i].file_offset = file_offsets[i];
         memcpy(&m->tensors[i].row_dim, e+5, 4);
         m->tensors[i].packed_cols = e[9] | (e[10]<<8) | (e[11]<<16);
     }
+
+    // Compute actual data sizes from file offsets (next - current, which includes 32-byte padding)
+    auto file_data_size = [&](int i) -> int {
+        if (i + 1 < n_tensors) {
+            int raw = (int)(file_offsets[i + 1] - file_offsets[i]);
+            // Round down to nearest 32 to strip padding
+            return raw - (raw % 32);
+        }
+        // Last tensor: infer from atlas file size
+        FSEEK(f, 0, SEEK_END);
+        int64_t fsize = FTELL(f);
+        return (int)(fsize - (int64_t)file_offsets[i]);
+    };
 
     // Load all tensor data
     for (int i = 0; i < n_tensors; i++) {
@@ -188,8 +198,14 @@ ATLAS_API AtlasModel* atlas_load(const char* path) {
                 t.data_size = t.row_dim * 2;  // fp16 1D
             }
             t.packed_cols = 0;
-        } else {  // other (lm_head)
-            t.data_size = t.row_dim * m->hidden_dim * 2;
+        } else {  // other (lm_head, GQA scales)
+            int actual_bytes = file_data_size(i);
+            int expected = t.row_dim * m->hidden_dim * 2;
+            if (actual_bytes < expected && actual_bytes > 0) {
+                t.data_size = actual_bytes;  // GQA scale vector: use real size
+            } else {
+                t.data_size = expected;  // lm_head matrix
+            }
             t.packed_cols = 0;
         }
 
@@ -207,11 +223,43 @@ ATLAS_API AtlasModel* atlas_load(const char* path) {
 // ─── Free model ─────────────────────────────────────────────────────────
 ATLAS_API void atlas_free(AtlasModel* m) {
     if (!m) return;
-    for (auto& t : m->tensors) vfree(t.data);
+    // Free valloc'd tensors (not mmap'd ones)
+    for (auto& t : m->tensors) {
+        if (t.data && !m->is_mapped(t.data)) vfree(t.data);
+    }
+    // Unmap cache if loaded
+    if (m->mmap_base) UnmapViewOfFile(m->mmap_base);
+    if (m->mmap_handle) CloseHandle(m->mmap_handle);
+    if (m->mmap_file) CloseHandle((HANDLE)m->mmap_file);
     delete m;
 }
 
+// ─── Model config struct ───────────────────────────────────────────────
+typedef struct {
+    int n_layers;
+    int hidden_dim;
+    int inter_dim;
+    int n_heads;
+    int n_kv_heads;
+    int head_dim;
+    int vocab_size;
+    float rope_theta;
+} AtlasModelConfig;
+
 // ─── Get model info ────────────────────────────────────────────────────
+ATLAS_API AtlasModelConfig atlas_get_config(AtlasModel* m) {
+    AtlasModelConfig cfg;
+    cfg.n_layers = m->n_layers;
+    cfg.hidden_dim = m->hidden_dim;
+    cfg.inter_dim = m->inter_dim;
+    cfg.n_heads = m->n_heads;
+    cfg.n_kv_heads = m->n_kv_heads;
+    cfg.head_dim = m->head_dim;
+    cfg.vocab_size = m->vocab_size;
+    cfg.rope_theta = m->rope_theta;
+    return cfg;
+}
+
 ATLAS_API void atlas_get_info(AtlasModel* m, int* n_layers, int* hidden_dim,
                                int* inter_dim, int* n_heads, int* n_kv_heads,
                                int* head_dim, int* vocab_size) {
@@ -222,6 +270,133 @@ ATLAS_API void atlas_get_info(AtlasModel* m, int* n_layers, int* hidden_dim,
     if (n_kv_heads) *n_kv_heads = m->n_kv_heads;
     if (head_dim) *head_dim = m->head_dim;
     if (vocab_size) *vocab_size = m->vocab_size;
+}
+
+// ─── Cache file ──────────────────────────────────────────────────────
+// Save decompressed int8 tensors to a .i8 cache file for instant reload.
+// Format: [n_tensors:4] then per-tensor [ttype:1][row_dim:4][pc:4][ds:4][off:8]
+//         then all tensor data concatenated.
+
+static void cache_path(const char* atlas_path, char* out, int out_size) {
+    snprintf(out, out_size, "%s", atlas_path);
+    int len = (int)strlen(out);
+    // Replace .atlas suffix with .i8 (or append .i8 if no .atlas)
+    const char* dot = strrchr(out, '.');
+    if (dot && _stricmp(dot, ".atlas") == 0) {
+        int prefix_len = (int)(dot - out);
+        out[prefix_len] = '.';
+        out[prefix_len+1] = 'i';
+        out[prefix_len+2] = '8';
+        out[prefix_len+3] = '\0';
+    } else {
+        strncat(out, ".i8", out_size - len - 1);
+    }
+}
+
+ATLAS_API void atlas_save_cache(AtlasModel* m, const char* atlas_path) {
+    char path[1024]; cache_path(atlas_path, path, sizeof(path));
+    FILE* f = fopen(path, "wb");
+    if (!f) { fprintf(stderr, "[CACHE] Cannot write %s\n", path); return; }
+
+    int n = (int)m->tensors.size();
+    fwrite(&n, 4, 1, f);
+
+    // Only cache int8-decoded tensors (ttype==3). Non-int8 tensors (norms, embed, GQA scales)
+    // have correct data from atlas_load and don't need caching.
+    std::vector<int64_t> offsets(n, -1);
+    int64_t cur = 0;
+    for (int i = 0; i < n; i++) {
+        auto& t = m->tensors[i];
+        if (t.ttype == 3 && t.data_size > 0 && t.data) {
+            offsets[i] = cur;
+            cur += t.data_size;
+        }
+    }
+
+    // Write header with correct offsets
+    for (int i = 0; i < n; i++) {
+        uint8_t ttype = (uint8_t)m->tensors[i].ttype;
+        int row_dim = m->tensors[i].row_dim;
+        int pc = m->tensors[i].packed_cols;
+        int ds = m->tensors[i].data_size;
+        int64_t off = offsets[i] >= 0 ? offsets[i] : 0;
+        fwrite(&ttype, 1, 1, f);
+        fwrite(&row_dim, 4, 1, f);
+        fwrite(&pc, 4, 1, f);
+        fwrite(&ds, 4, 1, f);
+        fwrite(&off, 8, 1, f);
+    }
+
+    // Write data in 64KB chunks to avoid fwrite buffer limits on single large writes
+    for (int i = 0; i < n; i++) {
+        if (offsets[i] < 0) continue;
+        const uint8_t* ptr = m->tensors[i].data;
+        int remaining = m->tensors[i].data_size;
+        while (remaining > 0) {
+            int chunk = remaining > 65536 ? 65536 : remaining;
+            size_t written = fwrite(ptr, 1, chunk, f);
+            if ((int)written != chunk) {
+                fprintf(stderr, "[CACHE] WARNING: tensor %d chunk short write %zu/%d (remaining %d)\n",
+                        i, written, chunk, remaining);
+                break;
+            }
+            ptr += chunk;
+            remaining -= chunk;
+        }
+    }
+    fclose(f);
+    printf("[CACHE] Saved %d tensors\n", n);
+}
+
+ATLAS_API int atlas_load_cache(AtlasModel* m, const char* atlas_path) {
+    char path[1024]; cache_path(atlas_path, path, sizeof(path));
+    HANDLE hFile = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return 0;
+
+    HANDLE hMap = CreateFileMappingA(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (!hMap) { CloseHandle(hFile); return 0; }
+
+    uint8_t* base = (uint8_t*)MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
+    if (!base) { CloseHandle(hMap); CloseHandle(hFile); return 0; }
+
+    int n = *(int*)base;
+    if (n != (int)m->tensors.size()) {
+        UnmapViewOfFile(base); CloseHandle(hMap); CloseHandle(hFile);
+        return 0;
+    }
+
+    uint8_t* hdr = base + 4;
+    int64_t data_start = 4 + (int64_t)n * 21;
+
+    int replaced = 0;
+    for (int i = 0; i < n; i++) {
+        uint8_t* e = hdr + i * 21;
+        int cttype = (int)e[0];
+        int row_dim; memcpy(&row_dim, e+1, 4);
+        int cpc; memcpy(&cpc, e+5, 4);
+        int ds; memcpy(&ds, e+9, 4);
+        int64_t off; memcpy(&off, e+13, 8);
+
+        auto& t = m->tensors[i];
+        if (t.ttype == 0 && cttype == 3 && ds > 0 && off >= 0) {
+            if (t.data) vfree(t.data);
+            t.ttype = 3;
+            t.row_dim = row_dim;
+            t.packed_cols = cpc;
+            t.data_size = ds;
+            t.data = (uint8_t*)(base + data_start + off);
+            replaced++;
+        }
+    }
+
+    // Store mmap handles for cleanup in atlas_free
+    m->mmap_base = base;
+    m->mmap_handle = hMap;
+    m->mmap_file = hFile;
+
+    printf("[CACHE] Loaded %d/%d tensors\n", replaced, n);
+    return replaced > 0 ? 1 : 0;
 }
 
 // ─── Decompress all TQ1 tensors to int8 in-place ──────────────────────
@@ -321,26 +496,6 @@ ATLAS_API const uint8_t* atlas_tensor_data(AtlasModel* m, int idx, int* size) {
     if (idx < 0 || idx >= (int)m->tensors.size()) return nullptr;
     if (size) *size = m->tensors[idx].data_size;
     return m->tensors[idx].data;
-}
-
-// ─── Find tensor by name pattern ────────────────────────────────────────
-// layer_pattern: e.g. "layers.0.mlp.down_proj.weight"
-// Returns tensor index or -1
-ATLAS_API int atlas_find_tensor(AtlasModel* m, const char* pattern, int layer) {
-    // Build the expected name prefix
-    char search[128];
-    snprintf(search, sizeof(search), "model.layers.%d.%s", layer, pattern);
-
-    // Read tensor names — we don't have them stored.
-    // Instead, we infer from the directory order and patterns:
-    // The atlas stores tensors in alphabetical order of their safetensors names.
-    // We can search by iterating and checking offsets.
-
-    // Since names are not in the atlas, we rely on the Python side
-    // to know the exact tensor indices. This function is a placeholder.
-    (void)m;
-    fprintf(stderr, "atlas_find_tensor: tensor names not stored in atlas\n");
-    return -1;
 }
 
 // ─── Matmul: TQ1 packed → float32 output ──────────────────────────────
@@ -688,14 +843,15 @@ static void silu_inplace(float* x, int n) {
     }
 }
 
-// ─── Forward one transformer layer (all 7 matmuls + attention in C) ──
-// input/output: [B, hidden_dim] float32
-// positions: [B] int32 position indices
-ATLAS_API void atlas_forward_layer(
+// ─── Internal: forward one transformer layer ──────────────────────────
+// input: [B, H] float32 (read-only, preserved for residual)
+// output: [B, H] float32 (must not alias input)
+// Per-layer K/V cache offset is computed from k_cache/v_cache + layer * n_kv * max_seq * hd
+static void forward_layer_internal(
     AtlasModel* m,
     const float* input, float* output, int B,
     const int* positions,
-    uint16_t* k_cache, uint16_t* v_cache,
+    uint16_t* k_cache_layer, uint16_t* v_cache_layer,
     int max_seq_len, int seq_now,
     int idx_ln1, int idx_q, int idx_k, int idx_v, int idx_o,
     int idx_ln2, int idx_gate, int idx_up, int idx_down) {
@@ -705,8 +861,6 @@ ATLAS_API void atlas_forward_layer(
     int qd = nH * hd, kvd = nKV * hd;
     int inter = m->inter_dim;
     float theta = m->rope_theta;
-
-    m->ensure_buffers(B);
 
     // ─── 1. Pre-attention RMSNorm ───
     {
@@ -725,7 +879,6 @@ ATLAS_API void atlas_forward_layer(
         }
     }
     float* x_norm = output;
-    memcpy(m->snap_norm1, x_norm, B * H * sizeof(float));
 
     // ─── 2. QKV projections (int8) ───
     auto get_i8 = [](const TensorInfo& t, int8_t*& w, int32_t*& rs,
@@ -761,7 +914,6 @@ ATLAS_API void atlas_forward_layer(
         get_i8(tq, w, rs, rows, dim, scale);
         matmul_reorder_deq(rows, dim, w, rs, m->buf_i8, max_abs,
                           scale, m->buf_act, m->buf_gate, B);
-        memcpy(m->snap_q, m->buf_gate, B * H * sizeof(float));
     }
     auto& tv = m->tensors[idx_v];
     int i8_v_dim = tv.packed_cols * 5;
@@ -780,7 +932,6 @@ ATLAS_API void atlas_forward_layer(
         }
         matmul_reorder_deq(rows, dim, w, rs, m->buf_i8, max_abs,
                           scale, m->buf_act, m->buf_hidden, B);
-        memcpy(m->snap_k, m->buf_hidden, B * kvd * sizeof(float));
     }
     // V projection: scratch=buf_act (reused again, free after K over), output=buf_up
     {
@@ -796,12 +947,10 @@ ATLAS_API void atlas_forward_layer(
         }
         matmul_reorder_deq(rows, dim, w, rs, m->buf_i8, max_abs,
                           scale, m->buf_act, m->buf_up, B);
-        memcpy(m->snap_v, m->buf_up, B * kvd * sizeof(float));
     }
 
     // ─── 3. Fused attention (reuse atlas_attention_f32) ───
     float* attn_out = (float*)alloca(B * qd * sizeof(float));
-    // Q in buf_gate, K in buf_hidden, V in buf_up
     float* q_f32 = (float*)alloca(B * qd * sizeof(float));
     float* k_f32 = (float*)alloca(B * kvd * sizeof(float));
     float* v_f32 = (float*)alloca(B * kvd * sizeof(float));
@@ -811,7 +960,7 @@ ATLAS_API void atlas_forward_layer(
         memcpy(v_f32 + b * kvd, m->buf_up + b * tv.row_dim, kvd * sizeof(float));
     }
     atlas_attention_f32(q_f32, k_f32, v_f32, positions,
-        k_cache, v_cache, max_seq_len, seq_now, B,
+        k_cache_layer, v_cache_layer, max_seq_len, seq_now, B,
         nH, nKV, hd, theta, attn_out);
 
     // ─── 4. O projection (int8) ───
@@ -826,7 +975,6 @@ ATLAS_API void atlas_forward_layer(
         quantize_f32_to_u8(m->buf_act, B, dim, max_abs, m->buf_i8);
         matmul_reorder_deq(rows, dim, w, rs, m->buf_i8, max_abs,
                           scale, m->buf_hidden, m->buf_gate, B);
-        memcpy(m->snap_o, m->buf_gate, B * H * sizeof(float));
     }
 
     // ─── 5. Residual: output = input + attn_out_proj ───
@@ -905,11 +1053,44 @@ ATLAS_API void atlas_forward_layer(
     }
 }
 
-// ─── Debug: get internal buffer pointers ──────────────────────────────
-ATLAS_API float* atlas_get_snap_q(AtlasModel* m) { return m->snap_q; }
-ATLAS_API float* atlas_get_snap_k(AtlasModel* m) { return m->snap_k; }
-ATLAS_API float* atlas_get_snap_v(AtlasModel* m) { return m->snap_v; }
-ATLAS_API float* atlas_get_snap_o(AtlasModel* m) { return m->snap_o; }
-ATLAS_API float* atlas_get_snap_norm1(AtlasModel* m) { return m->snap_norm1; }
+// ─── Forward ALL transformer layers in one C call ────────────────────
+// (single-layer atlas_forward_layer removed — fusion is always used)
+// hidden_states: [B, H] float32 — overwritten with final layer output
+// positions: [B] int32 position indices
+// layer_idx: [n_layers * 9] int32 — flat array of tensor indices per layer
+//           (ln1, q, k, v, o, ln2, gate, up, down) repeated for each layer
+// k_cache, v_cache: flat buffers [n_layers * n_kv_heads * max_seq * head_dim] uint16
+ATLAS_API void atlas_forward(
+    AtlasModel* m,
+    float* hidden_states, int B,
+    const int* positions,
+    uint16_t* k_cache, uint16_t* v_cache,
+    int max_seq_len, int seq_now,
+    const int* layer_idx, int n_layers) {
+
+    m->ensure_buffers(B);
+    int H = m->hidden_dim;
+    int nKV = m->n_kv_heads, hd = m->head_dim;
+
+    // Ping-pong: layer N output goes to separate buf_out (not buf_hidden, which is scratch)
+    float* buf_a = hidden_states;
+    float* buf_b = m->buf_out;
+
+    for (int L = 0; L < n_layers; L++) {
+        const int* idx = layer_idx + L * 9;
+        uint16_t* kc = k_cache + L * nKV * max_seq_len * hd;
+        uint16_t* vc = v_cache + L * nKV * max_seq_len * hd;
+        forward_layer_internal(m, buf_a, buf_b, B, positions,
+            kc, vc, max_seq_len, seq_now,
+            idx[0], idx[1], idx[2], idx[3], idx[4],
+            idx[5], idx[6], idx[7], idx[8]);
+        float* tmp = buf_a; buf_a = buf_b; buf_b = tmp;
+    }
+
+    // If odd number of layers, final output is in buf_b (not hidden_states)
+    if (n_layers % 2 == 1) {
+        memcpy(hidden_states, buf_b, (size_t)B * H * sizeof(float));
+    }
+}
 
 }  // extern "C"

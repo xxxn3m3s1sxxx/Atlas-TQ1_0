@@ -1,84 +1,72 @@
 # ATLAS — Falcon3 TQ1.0 Inference Engine
 
 ## Goal
-- TQ1.0 (Base-3, 5 ternary trits/byte) inference engine for Falcon3-10B on i5 laptop, end-to-end text generation via C++ DLL + Python.
+- TQ1.0 (Base-3, 5 ternary trits/byte) inference engine for Falcon3 models on i5 laptop, end-to-end text generation via C++ DLL + Python.
 
 ## Constraints & Preferences
-- 16 GB RAM only (no GPU); Falcon3-10B atlas file = 3.35 GB.
+- 16 GB RAM only (no GPU); atlas files: 1.21 GB (1B) to 3.27 GB (10B).
 - Target CPU: i5-1235U (Alder Lake, 8 OMP threads, AVX2+FMA).
-- Compiler: Clang 22.1.5 (LLVM MinGW x86_64-w64-windows-gnu) from WinGet.
-- OpenMP: dynamic link via `libomp.dll` (shipped with LLVM-MinGW). Set `KMP_DUPLICATE_LIB_OK=TRUE` to avoid conflict with numpy MKL's `libiomp5md.dll`.
-- Base-3 encoding and matmul kernels as before.
-- Same model architecture (1000042 theta, GQA 12/4 heads, etc).
-- **10B model only** on current machine (40 layers). No 7B safetensors available — only a GGUF variant exists.
+- Compiler: Clang LLVM-MinGW x86_64-w64-windows-gnu.
+- OpenMP: dynamic link via `libomp.dll`. Set `KMP_DUPLICATE_LIB_OK=TRUE` for numpy MKL compat.
+- **8 GB RAM**: 1B (~1.9 GB) and 3B (~4.7 GB) models run on 8 GB systems.
 
 ## Progress
 ### Done
-- Packed Falcon3-10B into `falcon3-10b-tq1.atlas` (3.35 GB, 643 tensors).
-- Core C++ DLL: load, matmul, rmsnorm, rope. Scalar LUT kernel, 4-way unrolled.
-- Python inference: full GQA attention (einsum + causal mask), RoPE, KV cache, SiLU FFN, autoregressive loop.
-- **fseek 32-bit overflow fix** (`_fseeki64` via FSEEK macro).
-- **2-bit packing fix** (was decoding as Base-3 instead of `& 3`, `>> 2`).
-- **Row ordering fix** (interleaved `ur*4+q` → stride `q*rows_packed+ur`). This was the root cause of corr≈0.
-- All L0 TQ1 projections verified corr > 0.999 with HF reference.
-- **OpenMP enabled**: `-fopenmp` in compile.bat, rebuilt `atlas.dll`.
-  - `down_proj` matmul: 31ms → 5.8ms (5.4× speedup)
-  - Decode: 0.3 → 1.0 tok/s on Falcon3-10B (3.3×)
-  - "What is 2+2?": 97s → 23s
-- **Fused attention** (`atlas_attention_f32`): RoPE + GQA + softmax + weighted sum in one C call.
-- **RMSNorm cache**: raw fp16 bytes cached to avoid repeated DLL roundtrips.
-- **Top-k/Top-p sampling**: added to `generate()` (default: top_k=40, top_p=0.9).
-- **Int8 matmul kernel**: `_mm256_maddubs_epi16` AVX2 dot product with offset trick.
-  - All 280 TQ1 tensors decompressed to int8 at load time (once), packed data freed.
-  - gate_proj 1tok: 8.9ms → 3.2ms (2.8× speedup)
-  - Layer 0 (hot): ~19ms (vs ~29ms before int8)
-  - Decode: 1.0 → ~1.4 tok/s (40% gain)
-- `KMP_DUPLICATE_LIB_OK=TRUE` set in `atlas_infer.py` for numpy MKL compat.
-- README paths fixed to relative/portable.
-- `atlas_*.dll` temp builds gitignored.
+- **All four Falcon3 models** packed, tested, verified:
 
-### Done (latest)
-- **VirtualAlloc fix**: CRT `new`/`delete` doesn't return freed packed data (3.35GB) to the OS → total ~16.35GB > 16GB → page thrashing during prefill (10.8s). Switched tensor data to `VirtualAlloc`/`VirtualFree` so memory is returned to OS on delete. Prefill: 10.8s → 2.97s (3.6×).
-- **fp16 embedding cache**: Embed weight kept as fp16 (1.6GB vs 3.2GB float32), converted on lookup → saves 1.6GB RAM. Decode: 1.4→1.6 tok/s from reduced memory pressure.
-- **`_rmsnorm` fix — two bugs found and fixed**:
-  1. `ctypes.create_string_buffer()` truncates fp16 data at first NULL byte (`\x00`). fp16 `1.0` = `\x00\x3C`, so RMSNorm weights truncated → zeroed most outputs. Fixed by caching DLL raw `ctypes.POINTER(c_uint8)` directly instead of `tobytes()` → `create_string_buffer`.
-  2. `len(x)` returns 1 for 2D array `(1, 3072)`. Changed to `x.shape[-1]`.
-- **C++ forward_layer verified corr > 0.99** for all 40 layers end-to-end against Python reference.
-- `generate("What is 2+2?")` → `"2+2=4"` (correct). `"Hello"` → `"Hello! How can I assist you today?"` (correct).
-- **KV swap bug fixed** earlier: K was written to buf_hidden but read from buf_up; V vice versa.
-- **seq_now bug in test**: original `test_layer0.py` 40-layer test used `seq_now=L+1` (ranges 1..40) instead of `seq_now=1` for single-token test. Causal mask masks extra positions so results are identical, but test was also affected by `_rmsnorm` bugs.
-- **Snap buffer overflow fixed**: `snap_q/k/v/o/norm1` allocated with initial B only, not resized on batch increase. Prefill (B=12) after decode warmup (B=1) wrote past end, causing access violation. Fixed by resizing snap buffers in `ensure_buffers`.
+| Model | Layers | Hidden×Inter | Heads | Atlas Size | Prefill | Decode | Per-Layer | RAM |
+|-------|--------|-------------|-------|-----------|---------|--------|-----------|-----|
+| Falcon3-1B | 18 | 2048×8192 | 8/4 | 1.21 GB | 26.7 tok/s | 8.9 tok/s | 3.5 ms | 1.9 GB |
+| Falcon3-3B | 22 | 3072×9216 | 12/4 | 1.95 GB | 20.4 tok/s | 4.9 tok/s | 5.2 ms | 4.7 GB |
+| Falcon3-7B | 28 | 3072×23040 | 12/4 | 2.74 GB | 10.0 tok/s | 2.4 tok/s | 13.7 ms | 8.9 GB |
+| Falcon3-10B | 40 | 3072×23040 | 12/4 | 3.27 GB | 6.2 tok/s | 1.7 tok/s | 15 ms | 11.9 GB |
 
-### Open
-- **Prefill matmul scaling**: seq=18 → ~75ms/layer, seq=1 → ~19ms. The 4× batch scaling gives only 1.3× slowdown vs 4× ideal — limited by memory bandwidth, not compute.
-- **Memory**: After VirtualAlloc fix + fp16 embed: int8 9.5GB + KVCache 0.34GB + embed fp16 1.6GB + Python ~0.5GB ≈ 11.9GB (was ~14.5GB). Fits comfortably in 16GB.
-- **head_dim=256** (not 128): Falcon3-10B config has `head_dim=256`, so Q output = 12×256 = 3072 = hidden_dim. AGENTS.md said 128 before — corrected.
+- **Int8 mmap cache (Bug 8: cache corruption)**: Five root causes fixed:
+  1. `atlas_save_cache`: seek-back pattern (`FSEEK`→`fwrite` offset→`FSEEK` data) produced duplicate offsets. Fixed: precompute all offsets via `std::vector<int64_t>`, write once.
+  2. `atlas_load`: ttype=2 GQA scales got `data_size = row_dim * hidden_dim * 2` (e.g., 24576 for shape [4]), over-reading 24KB+ into next tensor. Fixed: use actual file offset gaps (`file_data_size`) — if file gap < formula, use gap; else use formula (lm_head).
+  3. `atlas_save_cache`: cached ALL tensors (including inflated GQA scales). Fixed: only cache ttype==3 (int8-decoded) tensors.
+  4. `atlas_infer.py`: prefetch was skipped for cached loads. Fixed: always call `atlas_prefetch_int8` regardless of cache source.
+  5. `atlas_save_cache`: single `fwrite` of 70 MB+ tensors returned short writes on Windows. Fixed: write in 64 KB chunks.
+- **Cache performance**: 3B load 11.1s→3.5s (3×), 10B load 35.9s→15.3s (2.3×). 10B cache: 8.86 GB.
+- **fp16 lm_head RAM fix**: lm_head weight kept as fp16 (768 MB), lazily converted to fp32 on first access. `matmul_f16` uses fast full-size matmul (not chunked) for lm_head; saves 768 MB persistent RAM vs always-fp32. Fixes 10B OOM during warmup.
+
+All with `head_dim=256`, `rope_theta=1000042`, `vocab_size=131072`, GQA architecture.
+
+- **C++ layer loop fusion** (`atlas_forward`): all N layers run in one C call, eliminating Python loop. Ping-pong buffers (`hidden_states` ↔ `buf_out`) avoid per-layer copies. Dedicated `buf_out` prevents conflict with `buf_hidden` scratch. 10B prefill: 4.5→6.2 tok/s (+38%).
+- **All 7 critical bugs fixed** (fseek overflow, Base-3 decode, row stride, K/V swap, RMSNorm truncation, snap buffer overflow, TQ1 padding overflow). All four models verified corr > 0.99 end-to-end.
+- **VirtualAlloc fix**: CRT `new`/`delete` returns freed pages only on memory pressure, not to OS. VirtualAlloc/VirtualFree releases 3.35 GB packed data immediately after decompress. Prefill: 10.8→2.97s.
+- **fp16 embed cache**: embed weight kept as fp16 (1.6 GB), converted on lookup. Saves 1.6 GB RAM.
+- **fp16 lm_head**: kept as fp16, lazily converted to fp32 on first access. Saves 768 MB RAM vs always-fp32. Fixes 10B OOM during warmup.
+- **Int8 matmul kernel**: `_mm256_maddubs_epi16` AVX2 dot product with offset trick. Replaced scalar LUT at load time.
+- **v1.0.0 released** on GitHub (xxxn3m3s1sxxx/Atlas-TQ1_0) with prebuilt DLLs. Repo public.
+- **v1.0.1 sterilization**: snap_* debug buffers removed, `atlas_forward_layer` (dead since fusion) removed, `atlas_find_tensor` removed. Clean `AtlasModelConfig` struct + `atlas_get_config()` for FFI consumers.
+- **v1.0.1 new in cache**: int8 mmap cache (`.i8` companion file) — saves decompression on subsequent loads. 3B load 11.1s→3.5s, 10B load 35.9s→15.3s. 64KB chunked fwrite avoids short writes on large tensors.
+- **v1.0.1 new in memory**: lazy fp32 lm_head conversion (chunked → full matmul for 10B). RAM peak during warmup ~14.8 GB (10B) includes temp fp32 copy of lm_head (1.5 GB transient). After warmup, persistent RAM ~11.9 GB. 3B peak ~6.5 GB, persistent ~4.7 GB.
 
 ### Blocked
-- **7B model**: safetensors not present on this machine. GGUF variant exists at `C:\models\Falcon3-7B-Instruct-1.58bit-GGUF` but packer reads safetensors only.
+- **7B model**: safetensors not present on this machine. Only GGUF variant exists.
 
 ## Key Decisions
-- **TQ1 decompressed to int8 at C++ load time**: 280 tensors decoded once, packed data freed. Fast `maddubs` SIMD replaces LUT lookups.
-- **VirtualAlloc/VirtualFree for tensor data**: CRT `new`/`delete` doesn't return freed heap pages to OS. Using `VirtualAlloc`/`VirtualFree` ensures 3.35GB packed data is released after decompress, avoiding page thrashing.
-- **fp16 embed cache**: Embed weight kept as fp16 (not converted to fp32), saves 1.6GB RAM at cost of tiny conversion overhead per token.
-- **Per-tensor int8 cache in C++** (via `atlas_get_int8`): Python creates zero-copy numpy views into DLL memory.
-- **Scalar over AVX2 gather**: Gather was 4× slower (40 vs 162 tok/s) on Alder Lake.
-- **Dynamic OpenMP**: `libomp.dll` at runtime (no static libomp.a in LLVM-MinGW).
-- **Hybrid Python+C++**: Python handles norm, attention, RoPE; C++ DLL runs heavy int8 matmuls.
-- **OMP_NUM_THREADS**: Defaults to all cores. On i5-1235U (2P+8E), 8 threads gives best throughput.
+- **TQ1 decompressed to int8 at C++ load time**: 126-280 tensors decoded once, packed data freed. Fast `maddubs` SIMD.
+- **VirtualAlloc/VirtualFree**: CRT heap pages not returned to OS → VirtualFree with MEM_RELEASE frees both VA space and RAM immediately.
+- **fp16 embed cache**: Embed kept as fp16 to save 1.6 GB RAM.
+- **Cache raw ctypes pointer** instead of `create_string_buffer` for fp16 weight passing to avoid NULL-byte truncation.
+- **C++ layer fusion** (`atlas_forward`): all layers in one C call. Dedicated `buf_out` buffer for ping-pong (not `buf_hidden`, which is scratch).
+- **8GB RAM support**: explicitly documented in README for 1B and 3B models.
+- **File naming**: `falcon3-{size}b-tq1_0.atlas` convention (.atlas = engine, tq1_0 = format+version).
 
 ## Potential Next Steps
-1. **Prefill batching in C++**: Fuse all 7 matmuls for a layer into one call, reducing activation quantization overhead.
-2. **Batch FFT/strassen**: Not applicable.
+1. **Full C++ forward**: also fuse final RMSNorm + LM head matmul + sampling into C++. Would help 1B/3B most (remaining ~5ms Python overhead = 40% of decode time).
+2. **Mmap-based int8 loading**: Avoid load-time decompression, reduce start time from 5-26s to near-instant.
 3. **Profile-guided optimization**: Compile with PGO for 10-15% further gain.
-4. **Full C++ forward pass**: Rewrite entire per-layer forward in C++ (no Python loop), aim for 2×.
-5. **7B model**: Download safetensors from HF, repack for 7B benchmarks.
-6. **Mmap-based int8 loading**: Avoid load-time decompression from packed format.
+4. **Fuse embed lookup into C++**: Complete the C++ pipeline, eliminating all intermediate Python buffers.
 
 ## Relevant Files
 - `atlas_packer.py`: Packer — streams safetensors → TQ1 ATLAS file.
-- `atlas_infer.py`: Python inference engine — full forward pass + generate.
-- `atlas_api.cpp`: C-exported DLL — load, matmul, rmsnorm, rope, int8 matmul, decompress.
-- `atlas.dll`: Prebuilt DLL with OpenMP (96 KB) + `libomp.dll` (968 KB).
+- `atlas_infer.py`: Python inference engine — forward + generate.
+- `atlas_api.cpp`: C-exported DLL — load, decompress, `atlas_forward` (fused layers), int8 matmul, fused attention, norms, RoPE.
+- `atlas.dll`: Prebuilt DLL with OpenMP (107 KB) + `libomp.dll` (968 KB).
 - `compile.bat`: DLL build script (`clang++ -fopenmp -O2 -mavx2 -mfma`).
-- `C:\models\Falcon3-10B-Instruct-1.58bit\`: Safetensors + config + tokenizer.
+- `bench_atlas.py`: Benchmark — load time, per-layer profile, prefill + decode.
+- `C:\atlas\falcon3-{1b,3b,7b,10b}-tq1*.atlas`: Packed model files.
+- `C:\models\Falcon3-{3B,7B,10B}-Instruct-1.58bit\`: Safetensors + config + tokenizer.
