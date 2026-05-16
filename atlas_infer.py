@@ -381,13 +381,15 @@ class AtlasModel:
 
         out = x.copy()
         idx_slice = self._layer_idx_arr[layer_idx * 9 : (layer_idx + 1) * 9].copy()
+        # Offset K/V cache to this specific layer (atlas_forward loop starts at L=0)
+        kc = self.k_cache[layer_idx].reshape(-1).ctypes.data_as(ctypes.POINTER(ctypes.c_uint16))
+        vc = self.v_cache[layer_idx].reshape(-1).ctypes.data_as(ctypes.POINTER(ctypes.c_uint16))
         dll.atlas_forward(
             self.model_ptr,
             out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
             B,
             positions_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
-            self.k_cache.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
-            self.v_cache.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
+            kc, vc,
             self.max_seq_len, seq_now,
             idx_slice.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
             1)

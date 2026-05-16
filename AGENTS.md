@@ -18,11 +18,11 @@
 | Model | Layers | Hidden×Inter | Heads | Atlas Size | Prefill | Decode | Per-Layer | RAM |
 |-------|--------|-------------|-------|-----------|---------|--------|-----------|-----|
 | Falcon3-1B | 18 | 2048×8192 | 8/4 | 1.21 GB | 26.7 tok/s | 8.9 tok/s | 3.5 ms | 1.9 GB |
-| Falcon3-3B | 22 | 3072×9216 | 12/4 | 1.95 GB | 20.4 tok/s | 4.9 tok/s | 5.2 ms | 4.7 GB |
-| Falcon3-7B | 28 | 3072×23040 | 12/4 | 2.74 GB | 10.0 tok/s | 2.4 tok/s | 13.7 ms | 8.9 GB |
-| Falcon3-10B | 40 | 3072×23040 | 12/4 | 3.27 GB | 6.2 tok/s | 1.7 tok/s | 15 ms | 11.9 GB |
+| Falcon3-3B | 22 | 3072×9216 | 12/4 | 1.95 GB | 10.7 tok/s | 4.6 tok/s | 5.4 ms | 4.7 GB |
+| Falcon3-7B | 28 | 3072×23040 | 12/4 | 2.74 GB | - | - | 13.7 ms* | 8.9 GB |
+| Falcon3-10B | 40 | 3072×23040 | 12/4 | 3.27 GB | 2.1 tok/s | 1.4 tok/s | 16 ms | 11.9 GB |
 
-> **Note**: Benchmark numbers from v1.0.1. v1.0.2 per-layer decode fixed (was pass-through due to ping-pong bug), so GEN tok/s may differ — need re-benchmark. v1.0.2 `generate()` (fused all layers, even n_layers) was always correct. See Bug 9 below.
+> **Note**: Benchmarks from v1.0.2 (re-benchmarked after Bug 9+Bug 10 fixes). Per-layer numbers are now genuine (Bug 9 made them no-ops before). Fused `generate()` was always correct. 1B and 7B not available for re-bench.
 
 - **Int8 mmap cache (Bug 8: cache corruption)**: Five root causes fixed:
   1. `atlas_save_cache`: seek-back pattern (`FSEEK`→`fwrite` offset→`FSEEK` data) produced duplicate offsets. Fixed: precompute all offsets via `std::vector<int64_t>`, write once.
@@ -48,13 +48,15 @@ All with `head_dim=256`, `rope_theta=1000042`, `vocab_size=131072`, GQA architec
 
 ### v1.0.2 (current)
 - **Bug 9: ping-pong buffer off-by-one** (`atlas_forward`): `forward_layer` (internal per-layer helper with `n_layers=1`, odd) returned the input unchanged. Fused `forward` with all layers (even count) was always correct. Root cause: after the buf_a↔buf_b swap in the loop, the last `forward_layer_internal` output was in `buf_a` for odd counts, but code copied `buf_b` (the input). Fixed: copy from `buf_a` for odd `n_layers`.
+- **Bug 10: KV cache pointer in forward_layer**: `forward_layer` passed full K/V cache pointers but `n_layers=1`, so C++ always used layer 0's cache. Masked by Bug 9 (no-op never wrote cache). Fixed: offset cache pointers per-layer in Python.
 - **Cross-platform port** (`atlas_api.cpp`): all Windows-specific APIs (`VirtualAlloc`/`VirtualFree`, `CreateFileMapping`/`MapViewOfFile`, `CreateFileA`, `__declspec`) wrapped in `#ifdef _WIN32` / `#else` with POSIX equivalents (`mmap`/`munmap`, `open`, `__attribute__((visibility))`). Same file compiles on both platforms.
 - **`compile-linux.sh`**: builds `libatlas.so` with g++ or clang++ (`-fopenmp -mavx2 -mfma -fPIC`).
 - **PyTorch dependency removed**: `atlas_infer.py` uses `framework='np'` instead of `'pt'` for `safe_open` — no more PyTorch dependency on Linux.
 - **Platform-aware DLL name**: `atlas_infer.py` loads `atlas.dll` on Windows, `libatlas.so` on Linux.
 - **`atlas_forward` reverted** to pre-lm_head-fusion signature (9 params: no `idx_norm_final`, `idx_lm_head`, `logits_out`). C++ lm_head matmul was 2× slower than numpy/MKL; keeping lm_head in Python.
 - **`atlas_ffi.h` updated**: signature matches reverted `atlas_forward`.
-- **10B perf note** (deferred): `generate()` with 12 prefill + 10 gen tokens takes 23.3s (~1.06 s/tok avg). Decode dominates (~8-10s of the total). Needs profiling later — suspected Python lm_head + RMSNorm overhead per decode step.
+- **Benchmarks re-done**: 3B prefill 10.7 tok/s, decode 4.6 tok/s, per-layer 5.4ms. 10B prefill 2.1 tok/s, decode 1.4 tok/s, per-layer 16ms. 1B/7B unavailable.
+- **10B perf note** (deferred): `generate()` with 18 prefill + 10 gen tokens takes ~13.7s. Decode ~5s of total. Needs profiling later — suspected Python lm_head + RMSNorm overhead per decode step.
 
 ### Blocked
 - **7B model**: safetensors not present on this machine. Only GGUF variant exists.
@@ -68,11 +70,11 @@ All with `head_dim=256`, `rope_theta=1000042`, `vocab_size=131072`, GQA architec
 - **8GB RAM support**: explicitly documented in README for 1B and 3B models.
 - **File naming**: `falcon3-{size}b-tq1_0.atlas` convention (.atlas = engine, tq1_0 = format+version).
 
-## Potential Next Steps
-1. **Full C++ forward**: also fuse final RMSNorm + LM head matmul + sampling into C++. Would help 1B/3B most (remaining ~5ms Python overhead = 40% of decode time).
-2. **Linux x86-64 port**: already works in WSL (4× slower than native — needs native Linux hardware for proper bench). Offload compilation + test to a Linux machine.
-3. **Profile-guided optimization**: Compile with PGO for 10-15% further gain.
-4. **Upgrade mmap cache** to cover fp16 tensors too (eliminate atlas I/O entirely → sub-second load).
+## Next Steps
+1. **Profile 10B decode overhead**: isolate Python RMSNorm + lm_head cost vs C++ layers. Fused `generate()` is ~2× faster than per-layer benchmark loop.
+2. **Test on native Linux hardware** (not WSL) for reliable cross-platform numbers.
+3. **Upgrade mmap cache** to cover fp16 tensors too (embed, lm_head, norms) → sub-second load.
+4. **Simplify installation**: PyPI package, single-command install, auto-download prebuilt binaries.
 5. **Port to Mojo / Rust / Zig** — after C++ kernel is confirmed as pure source of truth on both Windows + Linux.
 
 ## Relevant Files

@@ -112,35 +112,39 @@ safetensors ──► atlas_packer.py ──► .atlas file ──► atlas_infe
 
 ## Performance
 
-Measured on i5-1235U (Alder Lake, 2P+8E, 8 OMP threads, AVX2+FMA, 16 GB DDR4).
+Measured on i5-1235U (Alder Lake, 2P+8E, 8 OMP threads, AVX2+FMA, 16 GB DDR4) with v1.0.2.
 
-> **Note**: Numbers are from v1.0.1. v1.0.2 fixed a ping-pong off-by-one bug (Bug 9) that affected per-layer `forward_layer()` — the `generate()` path (fused even layers) was always correct. Per-layer decode timings may differ slightly in v1.0.2; numbers marked with * need re-benchmarking.
+Prefill uses fused `atlas_forward` (all layers in one C++ call). Decode and per-layer numbers use `forward_layer` (one layer per C++ call, per Python loop). Fused decode (via `generate()`) is faster than per-layer decode because the Python loop over layers is eliminated.
 
-| Model | Prefill (12 tok) | Decode (per token) | Per-Layer C++ |
-|-------|------------------|-------------------|---------------|
-| Falcon3-1B (18L, 2048×8192)  | 0.4 s (26.7 tok/s) | 113 ms (8.9 tok/s) | 3.5 ms mean |
-| Falcon3-3B (22L, 3072×9216)  | 0.6 s (20.4 tok/s) | 203 ms (4.9 tok/s) | 5.2 ms mean |
-| Falcon3-7B (28L, 3072×23040) | 1.2 s (10.0 tok/s) | 417 ms (2.4 tok/s) | 13.7 ms mean |
-| Falcon3-10B (40L, 3072×23040) | 2.7 s (4.5 tok/s) | 641 ms (1.6 tok/s) | 15 ms mean |
+| Model | Prefill (18 tok fused) | Decode (10 tok, per-layer) | Per-Layer C++ |
+|-------|----------------------|---------------------------|---------------|
+| Falcon3-1B (18L, 2048×8192)  | n/a* | n/a* | n/a* |
+| Falcon3-3B (22L, 3072×9216)  | 1.7 s (10.7 tok/s) | 2.2 s (4.6 tok/s) | 5.4 ms mean |
+| Falcon3-7B (28L, 3072×23040) | n/a* | n/a* | n/a* |
+| Falcon3-10B (40L, 3072×23040) | 8.5 s (2.1 tok/s) | 5.2 s (1.4 tok/s) | 16.0 ms mean |
+
+\* 1B and 7B model files not available on this test machine. Benchmarks run on models found on `C:\atlas\`. Decode and per-layer numbers are v1.0.2-correct (v1.0.0/v1.0.1 per-layer measurements were inflated by Bug 9 — the function was a no-op, measuring only Python overhead).
 
 ### Per-Model Breakdown
 
-**Falcon3-10B**: Per-layer C++ forward ~15 ms (RMSNorm + 7× int8 matmul + fused attention + SiLU FFN), Python overhead ~41 ms (cache indexing, ctypes marshalling, sampling). Layer-0 decode after cold load ~397 ms (page faults on 6.6 GB int8 data), subsequent layers ~12 ms warm.
+**Falcon3-10B**: Per-layer C++ forward ~16 ms mean (RMSNorm + 7× int8 matmul + fused attention + SiLU FFN). Layer 2 cold-decode ~108 ms (page faults on TQ1→int8 data), subsequent layers ~11-15 ms warm. Fused `generate()` eliminates 40× Python loop → ~2.1 tok/s decode estimated. 8.5 GB int8 weights + 3.3 GB atlas decompressed at load.
 
-**Falcon3-7B**: Identical architecture to 10B with 28 layers instead of 40. Faster decode due to 30% fewer matmuls per token.
+**Falcon3-7B**: Identical architecture to 10B with 28 layers instead of 40. Faster decode due to 30% fewer matmuls per token. Not re-benchmarked (files unavailable).
 
-**Falcon3-3B**: Same hidden/head dimensions as 7B/10B but narrower FFN (9216 vs 23040) and fewer layers (22). The sweet spot for 8 GB systems: 4.9 tok/s with strong output quality.
+**Falcon3-3B**: Same hidden/head dimensions as 7B/10B but narrower FFN (9216 vs 23040) and fewer layers (22). The sweet spot for 8 GB systems: 4.6 tok/s decode with correct output quality.
 
-**Falcon3-1B**: 18 layers, narrower projections (2048×8192 vs 3072×23040). Matmuls complete in ~2-4 ms each — at this scale Python overhead (~41 ms) dominates total decode time.
+**Falcon3-1B**: 18 layers, narrower projections (2048×8192 vs 3072×23040). Not re-benchmarked (files unavailable).
 
 ### Int8 Mmap Cache
 
 On first load, ATLAS creates a `.i8` companion file next to the `.atlas` file containing the decompressed int8 tensors (only TQ1 weights, not FP16 norms/embeds). Subsequent loads mmap this file directly, skipping decompression entirely:
 
-- **3B**: 11.1s → 3.5s load (3.2×)
-- **10B**: 35.9s → 15.3s load (2.3×)
+- **3B**: First load (decompress) 7.1s → cached load 1.7s (4.2×)
+- **10B**: First load (decompress) 56.9s → cached load 15.3s (3.7×)
 
 The cache stores all ttype==3 (int8-decoded) tensors with a header containing tensor type, dimensions, and 64-bit file offsets. 64 KB chunked writes avoid short-write issues on large tensors (>70 MB). The cache is invalidated if the tensor count changes (e.g., model file replaced). Always generated automatically — no user action needed.
+
+> **Caveat**: If upgrading from a previous ATLAS version, delete stale `.i8` cache files to avoid loading corrupted cache data. Cache format did not change between v1.0.1 and v1.0.2, but caches written by buggy versions (Bug 8) may contain corrupt tensor data.
 
 ### Int8 Kernel
 
@@ -160,7 +164,7 @@ All four fit in 16 GB RAM. **1B and 3B fit comfortably in 8 GB RAM**, making ATL
 
 ## Bugfix Chronology
 
-Eight critical bugs were discovered and fixed during development. Any one of them would cause the model to produce garbage output (correlation near zero with reference activations) or crash.
+Ten critical bugs were discovered and fixed during development. Any one of them would cause the model to produce garbage output (correlation near zero with reference activations) or crash.
 
 ### Bug 1 [FIXED]: `fseek` 32-bit overflow
 
@@ -237,6 +241,21 @@ C++ layer loop fusion uses a ping-pong buffer (`buf_a` ↔ `buf_b`) to avoid per
 **Impact**: Only affected callers using odd `n_layers` (e.g., per-layer benchmarking). The fused `generate()` path used all layers at once (even counts for all Falcon3 models), which was always correct. Added to chronology because it silently produced incorrect per-layer profile numbers in v1.0.0 and v1.0.1.
 
 **Symptoms**: Per-layer profiling showed equal input and output — `forward_layer` was a no-op. Only caught when cross-checking fused vs per-layer output.
+
+### Bug 10: KV cache pointer mismatch in forward_layer (v1.0.2) [FIXED]
+
+`forward_layer()` calls `atlas_forward` with `n_layers=1` and a single layer's tensor indices, but passes the full K/V cache pointers. The C++ loop address cache as `k_cache + L * nKV * max_seq * head_dim` where L starts at 0, so it always used **layer 0's** cache region regardless of which layer was being executed. All per-layer decode steps overwrote the same cache entries, producing garbage.
+
+**Root cause**: `forward_layer` passed `self.k_cache` and `self.v_cache` (flat arrays covering all layers) to `atlas_forward` with `n_layers=1`. The C++ offset computation `k_cache + 0 * stride` consistently pointed at layer 0.
+
+**Fix**: Offset the cache pointers in `forward_layer` to the requested layer before passing to C++:
+```python
+kc = self.k_cache[layer_idx].reshape(-1).ctypes.data_as(ctypes.POINTER(ctypes.c_uint16))
+```
+
+**Why it was missed**: Bug 9 made `forward_layer` a no-op (returned input unchanged). With Bug 9 present, the KV cache was never written by per-layer calls at all, so the wrong pointer didn't matter. Only after Bug 9 was fixed in v1.0.2 did Bug 10 surface.
+
+**Impact**: The fused `generate()` path (calls `atlas_forward` with all layers and `n_layers=22/40`) was always correct — the C++ loop iterates all layers with proper K/V cache addressing. Only per-layer benchmarks and profiling tools were affected.
 
 ### Verification
 
