@@ -115,7 +115,7 @@ struct AtlasModel {
 
         int max_dim = inter_dim > hidden_dim ? inter_dim : hidden_dim;
         if (n_heads * head_dim > max_dim) max_dim = n_heads * head_dim;
-        int max_aligned = (max_dim + 31) & ~31;
+        int max_aligned = ((max_dim + 7) + 31) & ~31;  // +7 for TQ1 padding (packed_cols*5 up to dim+4)
 
         buf_gate = (float*)VirtualAlloc(NULL, (size_t)B * inter_dim * sizeof(float), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         buf_up = (float*)VirtualAlloc(NULL, (size_t)B * inter_dim * sizeof(float), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
