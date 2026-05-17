@@ -1058,7 +1058,9 @@ static void forward_layer_internal(
     }
     float* x_norm2 = m->buf_act;
 
-    // ─── 7. FFN: gate + up projections (int8) ───
+    // ─── 7. FFN: fused gate + up projections (one OMP region) ───
+    // Fused kernel processes both in one pass: shared activation, no scratch buffer,
+    // reorder+dequant inline.
     auto& tg = m->tensors[idx_gate];
     auto& tu = m->tensors[idx_up];
     int g_dim = tg.packed_cols * 5;
@@ -1071,19 +1073,87 @@ static void forward_layer_internal(
     }
     quantize_f32_to_u8(m->buf_act, B, ffn_dim, max_abs, m->buf_i8);
 
-    // Gate
     {
-        int8_t* w; int32_t* rs; int rows, dim; float scale;
-        get_i8(tg, w, rs, rows, dim, scale);
-        matmul_reorder_deq(rows, dim, w, rs, m->buf_i8, max_abs,
-                          scale, m->buf_hidden, m->buf_gate, B);
-    }
-    // Up
-    {
-        int8_t* w; int32_t* rs; int rows, dim; float scale;
-        get_i8(tu, w, rs, rows, dim, scale);
-        matmul_reorder_deq(rows, dim, w, rs, m->buf_i8, max_abs,
-                          scale, m->buf_hidden, m->buf_up, B);
+        int8_t* gw; int32_t* grs; int g_rows, g_dim_v; float g_scale;
+        int8_t* uw; int32_t* urs; int u_rows, u_dim_v; float u_scale;
+        get_i8(tg, gw, grs, g_rows, g_dim_v, g_scale);
+        get_i8(tu, uw, urs, u_rows, u_dim_v, u_scale);
+        int rows = g_rows, dim_w = g_dim_v;
+        int rows_packed = rows / 4;
+
+        #ifdef _OPENMP
+        #pragma omp parallel for
+        #endif
+        for (int ur = 0; ur < rows_packed; ur++) {
+            const int8_t* gw4 = gw + ur * 4 * dim_w;
+            const int8_t* uw4 = uw + ur * 4 * dim_w;
+            int32_t g_off[4] = {128 * grs[ur*4+0], 128 * grs[ur*4+1],
+                                128 * grs[ur*4+2], 128 * grs[ur*4+3]};
+            int32_t u_off[4] = {128 * urs[ur*4+0], 128 * urs[ur*4+1],
+                                128 * urs[ur*4+2], 128 * urs[ur*4+3]};
+
+            for (int b = 0; b < B; b++) {
+                const uint8_t* a = m->buf_i8 + b * ffn_dim;
+                float deq = max_abs[b] / 127.0f;
+
+                float g_val[4], u_val[4];
+                for (int sub = 0; sub < 4; sub++) {
+                    const int8_t* wg = gw4 + sub * dim_w;
+                    const int8_t* wu = uw4 + sub * dim_w;
+                    int c = 0, g_dot = 0, u_dot = 0;
+
+                    __m256i g_acc = _mm256_setzero_si256();
+                    __m256i u_acc = _mm256_setzero_si256();
+                    for (; c + 32 <= dim_w; c += 32) {
+                        __m256i au = _mm256_loadu_si256((const __m256i*)(a + c));
+                        __m256i g_wv = _mm256_loadu_si256((const __m256i*)(wg + c));
+                        __m256i u_wv = _mm256_loadu_si256((const __m256i*)(wu + c));
+                        g_acc = _mm256_add_epi32(g_acc,
+                            _mm256_madd_epi16(_mm256_maddubs_epi16(au, g_wv), _mm256_set1_epi16(1)));
+                        u_acc = _mm256_add_epi32(u_acc,
+                            _mm256_madd_epi16(_mm256_maddubs_epi16(au, u_wv), _mm256_set1_epi16(1)));
+                    }
+
+                    {
+                        __m128i lo = _mm256_castsi256_si128(g_acc);
+                        __m128i hi = _mm256_extracti128_si256(g_acc, 1);
+                        __m128i s = _mm_add_epi32(lo, hi);
+                        s = _mm_hadd_epi32(s, s);
+                        s = _mm_hadd_epi32(s, s);
+                        g_dot = _mm_cvtsi128_si32(s);
+                    }
+                    {
+                        __m128i lo = _mm256_castsi256_si128(u_acc);
+                        __m128i hi = _mm256_extracti128_si256(u_acc, 1);
+                        __m128i s = _mm_add_epi32(lo, hi);
+                        s = _mm_hadd_epi32(s, s);
+                        s = _mm_hadd_epi32(s, s);
+                        u_dot = _mm_cvtsi128_si32(s);
+                    }
+
+                    for (; c < dim_w; c++) {
+                        g_dot += (int)a[c] * (int)wg[c];
+                        u_dot += (int)a[c] * (int)wu[c];
+                    }
+
+                    g_dot -= g_off[sub]; u_dot -= u_off[sub];
+                    g_val[sub] = (float)g_dot * deq / g_scale;
+                    u_val[sub] = (float)u_dot * deq / u_scale;
+                }
+
+                // Reorder inline: each packed group scatters to 4 HF rows
+                float* g_out = m->buf_gate + b * rows;
+                float* u_out = m->buf_up + b * rows;
+                g_out[0 * rows_packed + ur] = g_val[0];
+                g_out[1 * rows_packed + ur] = g_val[1];
+                g_out[2 * rows_packed + ur] = g_val[2];
+                g_out[3 * rows_packed + ur] = g_val[3];
+                u_out[0 * rows_packed + ur] = u_val[0];
+                u_out[1 * rows_packed + ur] = u_val[1];
+                u_out[2 * rows_packed + ur] = u_val[2];
+                u_out[3 * rows_packed + ur] = u_val[3];
+            }
+        }
     }
 
     // ─── 8. SiLU(gate) * up ───

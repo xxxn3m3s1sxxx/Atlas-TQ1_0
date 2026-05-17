@@ -74,6 +74,22 @@ Der `lm_head` Matmul-Block (Vokabular-Projektion) wurde vollständig aus der Pyt
 * **`_matmul_f16` fallback**: auto-detects null tensor data and redirects to GEMV — all existing bench/tools/scripts continue to work.
 * **`atlas_ffi.h` updated**: `atlas_quantize_lmhead(model, idx)` + `atlas_lmhead_gemv(model, act, out, B)`.
 
+### v1.0.5 (current) — Fused Gate/Up FFN Pipeline
+* Fused sequential `gate_proj` and `up_proj` execution into a single OMP parallel region over 4-row packed groups.
+* Eliminated raw matmul scratch buffer (`buf_hidden`) — inline reorder+dequant writes directly to `buf_gate`/`buf_up`.
+* Shared activation quantization stays hot in L1 cache (no eviction between gate+up).
+* **Benchmark (10B):**
+
+| Metrik | v1.0.4 (separat) | v1.0.5 (fused) | Δ |
+|--------|:-:|:-:|:-:|
+| C++ layers total | 612.0 ms | **554.9 ms** | **−57 ms (9.3%)** |
+| Per-layer mean | 15.3 ms | **13.9 ms** | **−1.4 ms** |
+| Full decode step | ~632 ms | **~576 ms** | **−56 ms (8.8%)** |
+| GEN (9 tok) | 4.8 s (1.9 tok/s) | **4.4 s (2.0 tok/s)** | **+0.1 tok/s** |
+
+* **Coherence verified**: `"The capital of France is Paris."` — same exact output.
+* No file format change — fully backward compatible with v1.0.4 `.atlas` files.
+
 ### Blocked
 - **7B model**: safetensors not present on this machine. Only GGUF variant exists.
 
