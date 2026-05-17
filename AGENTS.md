@@ -22,12 +22,14 @@
 - **False Alarm corr=0.23**: Two bugs in Python test reference (not engine): `_rmsnorm` in-place residual corruption + shared quantization gap. Fixed reference gives **corr=0.9967**, max_diff=4.0.
 - **v1.0.9 Memory Audit — 4 bugs fixed**: AllocHdr fix (Linux munmap leak), is_mapped guard before vfree (mmap double-free), proper mmap_size tracking (Windows), Linux fd close.
 - **v1.1.0 Production Hardening**: AllocHdr-based valloc/vfree, is_mapped guards, fd close on Linux, int8 quant clip fix in Python.
+- **v1.2.0-pre (C++ Sampling + generate)**: `atlas_set_seed` (Xoshiro256**), `atlas_sample` (Gumbel-max top-k/top-p, O(V)), `atlas_generate` (single C-call decode loop with embed lookup + rmsnorm + lm_head GEMV + sample + EOS). Python `generate_c()` wraps it — 1 FFI call per generation instead of per-token. Cached layer index array in `AtlasModel::layer_idx_cache`.
 
 ### In Progress
 - **(none)**
 
 ### Blocked
-- **1B greedy degeneration**: Not fixable in engine. 1.58-bit quant 1B model has `,` as argmax (p=0.43, entropy 2.75). Requires sampling.
+- **10B coherence test**: 5.7 GB free on C:\ — .i8 cache needs ~9.5 GB. Blocked until disk space freed.
+- **1B greedy degeneration**: Model-inherent (`,` p=0.43). Requires sampling (`T≥0.7`, `top_k=40`, `top_p=0.9`). Not an engine bug.
 - **WSL performance**: ~4–5× slower than native Windows.
 - **8 GB RAM limit**: 10B does not fit on 8 GB machines.
 

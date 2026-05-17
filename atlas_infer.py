@@ -132,6 +132,22 @@ dll.atlas_attention_f32.argtypes = [
     ctypes.POINTER(ctypes.c_float),   # output
 ]
 
+dll.atlas_set_seed.restype = None
+dll.atlas_set_seed.argtypes = [ctypes.c_uint64]
+
+dll.atlas_sample.restype = None
+dll.atlas_sample.argtypes = [ctypes.c_void_p,
+    ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_int),
+    ctypes.c_float, ctypes.c_int, ctypes.c_float]
+
+dll.atlas_generate.restype = ctypes.c_int
+dll.atlas_generate.argtypes = [ctypes.c_void_p,
+    ctypes.POINTER(ctypes.c_int), ctypes.c_int,
+    ctypes.POINTER(ctypes.c_uint16), ctypes.POINTER(ctypes.c_uint16),
+    ctypes.c_int, ctypes.c_int,
+    ctypes.c_float, ctypes.c_int, ctypes.c_float,
+    ctypes.POINTER(ctypes.c_int)]
+
 # ─── Model class ─────────────────────────────────────────────────────────
 class AtlasModel:
     def __init__(self, atlas_path, safetensors_path=None, model_dir=None):
@@ -167,6 +183,9 @@ class AtlasModel:
         else:
             raise RuntimeError("Model has no embedded names and no safetensors file provided")
         self.n_tensors = len(self.tensor_names)
+
+        # Seed C++ PRNG
+        dll.atlas_set_seed(np.random.randint(0, 2**31, dtype=np.int64) ^ int(time.time_ns()))
 
         print(f"[Atlas] {self.n_layers}L {self.hidden}H {self.inter}I "
               f"{self.n_heads}/{self.n_kv_heads} heads | "
@@ -586,6 +605,55 @@ class AtlasModel:
             if idx >= 0:
                 text = text[:idx]
         return text
+
+    def generate_c(self, prompt, max_new_tokens=50, temperature=1.0,
+                   top_k=40, top_p=0.9):
+        """Generate via atlas_generate (single C call, v1.2.0)."""
+        try:
+            if self._tok is not None:
+                from transformers import PreTrainedTokenizerFast
+                tok = PreTrainedTokenizerFast(
+                    tokenizer_object=self._tok,
+                    chat_template=self._chat_template)
+                tok.add_special_tokens({"pad_token": "<|pad|>"})
+            else:
+                model_dir = getattr(self, '_model_dir', None)
+                if not model_dir:
+                    model_dir = os.path.dirname(self._safe_path) if self._safe_path else '.'
+                tok = AutoTokenizer.from_pretrained(
+                    model_dir, local_files_only=True)
+        except Exception as e:
+            return f"[TOKENIZER ERROR: {e}]"
+
+        if isinstance(prompt, str):
+            prompt = [{"role": "user", "content": prompt}]
+        text = tok.apply_chat_template(prompt, tokenize=False, add_generation_prompt=True)
+        input_ids = tok.encode(text)
+        n_input = len(input_ids)
+
+        in_arr = (ctypes.c_int * n_input)(*input_ids)
+        k_cache = self.k_cache.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16))
+        v_cache = self.v_cache.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16))
+        out_arr = (ctypes.c_int * max_new_tokens)()
+
+        n_gen = dll.atlas_generate(
+            self.model_ptr, in_arr, n_input,
+            k_cache, v_cache,
+            self.max_seq_len, max_new_tokens,
+            float(temperature), int(top_k), float(top_p),
+            out_arr)
+
+        if n_gen < 0:
+            return "[ATLAS: atlas_generate failed]"
+
+        output = list(out_arr[:n_gen])
+        decoded = tok.decode(output, skip_special_tokens=True)
+        stops = ['<|user|>', '<|system|>', '<|end|>']
+        for stop in stops:
+            idx = decoded.find(stop)
+            if idx >= 0:
+                decoded = decoded[:idx]
+        return decoded
 
     def _lmhead_gemv(self, h_norm):
         """Logits via C++ int8 GEMV (per-row symmetric int8 lm_head + u8 activation)."""

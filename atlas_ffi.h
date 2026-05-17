@@ -37,6 +37,7 @@
 #define ATLAS_FFI_H
 
 #include <stdint.h>
+#include <stddef.h>
 
 #ifdef _WIN32
   #ifdef ATLAS_BUILD_DLL
@@ -152,6 +153,33 @@ ATLAS_API void atlas_forward(void* model,
     uint16_t* k_cache, uint16_t* v_cache,
     int max_seq_len, int seq_now,
     const int* layer_idx, int n_layers);
+
+// ─── v1.2.0: Sampling + generation ────────────────────────────────────
+// Seed the internal Xoshiro256** PRNG. Call once before generation.
+ATLAS_API void atlas_set_seed(uint64_t seed);
+
+// Sample one token from logits using Gumbel-max with top-k/top-p.
+// logits: [vocab_size] float32 — modified in-place (used as scratch).
+// output: [1] int32 — receives the sampled token ID.
+ATLAS_API void atlas_sample(void* model, float* logits, int* output,
+                             float temperature, int top_k, float top_p);
+
+// End-to-end autoregressive generation. Single C call for the entire decode loop.
+// Allocates internal scratch buffers (embedding, norm, logits). KV cache must be
+// pre-allocated by the caller.
+//
+// input_ids:  [n_input] int32 — tokenized prompt IDs
+// k/v_cache:  [n_layers × n_kv_heads × max_seq_len × head_dim] uint16 (zero-filled or reused)
+// output_ids: [max_new_tokens] int32 — receives generated token IDs
+//
+// Returns: number of tokens actually generated ( ≤ max_new_tokens ), or -1 on error.
+// Stops when EOS token (id=0) is produced or max_new_tokens is reached.
+ATLAS_API int atlas_generate(void* model,
+    const int* input_ids, int n_input,
+    uint16_t* k_cache, uint16_t* v_cache,
+    int max_seq_len, int max_new_tokens,
+    float temperature, int top_k, float top_p,
+    int* output_ids);
 
 // ─── Int8 lm_head ─────────────────────────────────────────────────────
 // Quantize lm_head from fp16 to per-row symmetric int8 (~403 MB vs 1.5 GB fp32).

@@ -4,6 +4,8 @@
 #include <cstdio>
 #include <cstring>
 #include <cmath>
+#include <cfloat>
+#include <algorithm>
 #include <vector>
 #include <string>
 #include <immintrin.h>
@@ -66,6 +68,97 @@
   #define STRICMP strcasecmp
 #endif
 
+// ─── Xoshiro256** PRNG (thread-safe, 64-bit) ──────────────────────────
+static uint64_t xoshiro_state[4] = {0};
+
+static void xoshiro_seed(uint64_t seed) {
+    auto sm64 = [](uint64_t& s) {
+        s += 0x9E3779B97F4A7C15ull;
+        uint64_t z = s;
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+        return z ^ (z >> 31);
+    };
+    xoshiro_state[0] = sm64(seed);
+    xoshiro_state[1] = sm64(seed);
+    xoshiro_state[2] = sm64(seed);
+    xoshiro_state[3] = sm64(seed);
+}
+
+static uint64_t xoshiro_next() {
+    uint64_t t = xoshiro_state[1] << 17;
+    xoshiro_state[2] ^= xoshiro_state[0];
+    xoshiro_state[3] ^= xoshiro_state[1];
+    xoshiro_state[1] ^= xoshiro_state[2];
+    xoshiro_state[0] ^= xoshiro_state[3];
+    xoshiro_state[2] ^= t;
+    t = xoshiro_state[3];
+    t = (t ^ (t >> 16)) * 0x45D9F3BEB5AADB97ull;
+    t = (t ^ (t >> 16)) * 0x45D9F3BEB5AADB97ull;
+    return t ^ (t >> 16);
+}
+
+static float xoshiro_float() {
+    return (float)((xoshiro_next() >> 11) * 0x1.0p-53);
+}
+
+// ─── Gumbel-max sample internal (used by both atlas_sample and atlas_generate) ──
+// Modifies logits in-place as scratch. Returns sampled token ID.
+static int gumbel_sample(float* logits, int V,
+                          float temperature, int top_k, float top_p) {
+    if (temperature > 0.0f && temperature != 1.0f) {
+        float invT = 1.0f / temperature;
+        for (int i = 0; i < V; i++) logits[i] *= invT;
+    }
+
+    // Top-k: find kth largest, zero out below it
+    if (top_k > 0 && top_k < V) {
+        std::vector<float> copy(logits, logits + V);
+        std::nth_element(copy.begin(), copy.begin() + top_k - 1, copy.end(),
+                         [](float a, float b) { return a > b; });
+        float threshold = copy[top_k - 1];
+        for (int i = 0; i < V; i++)
+            if (logits[i] < threshold) logits[i] = -FLT_MAX / 4;
+    }
+
+    // Softmax (max-subtraction for numerical stability) into probs
+    float max_val = -FLT_MAX / 4;
+    for (int i = 0; i < V; i++) if (logits[i] > max_val) max_val = logits[i];
+    float sum_exp = 0.0f;
+    for (int i = 0; i < V; i++) sum_exp += expf(logits[i] - max_val);
+    float inv_sum = 1.0f / (sum_exp + 1e-38f);
+    for (int i = 0; i < V; i++) logits[i] = expf(logits[i] - max_val) * inv_sum;
+
+    // Top-p: find nucleus via descending sort, mask tail
+    if (top_p > 0.0f && top_p < 1.0f) {
+        std::vector<int> idx(V);
+        for (int i = 0; i < V; i++) idx[i] = i;
+        std::sort(idx.begin(), idx.end(),
+                  [&](int a, int b) { return logits[a] > logits[b]; });
+        float cum = 0.0f;
+        for (int i = 0; i < V; i++) {
+            cum += logits[idx[i]];
+            if (cum > top_p) {
+                for (int j = i + 1; j < V; j++) logits[idx[j]] = 0.0f;
+                break;
+            }
+        }
+    }
+
+    // Gumbel-max: add noise, take argmax
+    int best = 0;
+    float best_val = -FLT_MAX / 4;
+    for (int i = 0; i < V; i++) {
+        if (logits[i] <= 0.0f) continue;
+        float u = xoshiro_float();
+        if (u <= 0.0f) u = 1e-38f;
+        float noise = -logf(-logf(u));
+        float val = logf(logits[i]) + noise;
+        if (val > best_val) { best_val = val; best = i; }
+    }
+    return best;
+}
+
 extern "C" {
 
 // ─── LUT ───────────────────────────────────────────────────────────────
@@ -120,6 +213,10 @@ struct AtlasModel {
     std::vector<TensorInfo> tensors;
     // Tensor names (loaded from v4+ atlas files, eliminates safetensors dependency)
     std::vector<std::string> tensor_names;
+
+    // Cached layer index array for atlas_generate (v1.2.0)
+    std::vector<int> layer_idx_cache;
+    bool has_layer_idx = false;
 
     // Pre-allocated scratch buffers for forward_layer (lazy init)
     float* buf_gate = nullptr;      // [max_batch * inter_dim]
@@ -1703,6 +1800,170 @@ ATLAS_API void atlas_lmhead_gemv(AtlasModel* m, const float* act,
 
     atlas_vfree((uint8_t*)act_u8);
     atlas_vfree((uint8_t*)max_abs);
+}
+
+// ─── v1.2.0: Seed PRNG ─────────────────────────────────────────────────
+ATLAS_API void atlas_set_seed(uint64_t seed) {
+    xoshiro_seed(seed ? seed : 0xDEADBEEFCAFEBABEull);
+}
+
+// ─── v1.2.0: Sample one token via Gumbel-max ──────────────────────────
+ATLAS_API void atlas_sample(AtlasModel* m, float* logits, int* output,
+                             float temperature, int top_k, float top_p) {
+    (void)m;
+    if (!output || !logits) return;
+    *output = gumbel_sample(logits, m ? m->vocab_size : 131072,
+                             temperature, top_k, top_p);
+}
+
+// ─── v1.2.0: End-to-end generation (single C call) ───────────────────
+// Builds layer index array from tensor names (cached after first call).
+static void ensure_layer_idx(AtlasModel* m) {
+    if (m->has_layer_idx) return;
+    auto& names = m->tensor_names;
+    auto find = [&](const std::string& n) -> int {
+        for (int i = 0; i < (int)names.size(); i++)
+            if (names[i] == n) return i;
+        return -1;
+    };
+    m->layer_idx_cache.clear();
+    m->layer_idx_cache.reserve(m->n_layers * 9);
+    for (int L = 0; L < m->n_layers; L++) {
+        char buf[128];
+        auto push = [&](const char* suffix) {
+            snprintf(buf, sizeof(buf), "model.layers.%d.%s", L, suffix);
+            m->layer_idx_cache.push_back(find(buf));
+        };
+        push("input_layernorm.weight");
+        push("self_attn.q_proj.weight");
+        push("self_attn.k_proj.weight");
+        push("self_attn.v_proj.weight");
+        push("self_attn.o_proj.weight");
+        push("post_attention_layernorm.weight");
+        push("mlp.gate_proj.weight");
+        push("mlp.up_proj.weight");
+        push("mlp.down_proj.weight");
+    }
+    m->has_layer_idx = true;
+}
+
+ATLAS_API int atlas_generate(AtlasModel* m,
+    const int* input_ids, int n_input,
+    uint16_t* k_cache, uint16_t* v_cache,
+    int max_seq_len, int max_new_tokens,
+    float temperature, int top_k, float top_p,
+    int* output_ids)
+{
+    if (!m || !input_ids || !output_ids || n_input < 1 || max_new_tokens < 1)
+        return -1;
+
+    // Find required tensors by name
+    int idx_norm = -1, idx_embed = -1;
+    for (int i = 0; i < (int)m->tensor_names.size(); i++) {
+        if (m->tensor_names[i] == "model.norm.weight") idx_norm = i;
+        if (m->tensor_names[i] == "model.embed_tokens.weight") idx_embed = i;
+    }
+    if (idx_norm < 0 || idx_embed < 0) {
+        fprintf(stderr, "[ATLAS] atlas_generate: missing norm/embed tensors\n");
+        return -1;
+    }
+
+    int H = m->hidden_dim;
+    int V = m->vocab_size;
+    uint16_t* embed_w = (uint16_t*)m->tensors[idx_embed].data;
+    uint8_t* norm_w = m->tensors[idx_norm].data;
+
+    if (!m->lm_head_quantized) {
+        fprintf(stderr, "[ATLAS] atlas_generate: lm_head not quantized\n");
+        return -1;
+    }
+
+    ensure_layer_idx(m);
+    const int* layer_idx = m->layer_idx_cache.data();
+
+    // Allocate scratch: embedding buffer, norm scratch, logits
+    float* embed_buf = (float*)atlas_valloc((size_t)n_input * H * sizeof(float));
+    float* h_norm = (float*)atlas_valloc((size_t)H * sizeof(float));
+    float* logits = (float*)atlas_valloc((size_t)V * sizeof(float));
+    if (!embed_buf || !h_norm || !logits) {
+        if (embed_buf) atlas_vfree((uint8_t*)embed_buf);
+        if (h_norm) atlas_vfree((uint8_t*)h_norm);
+        if (logits) atlas_vfree((uint8_t*)logits);
+        return -1;
+    }
+
+    // ─── Prefill: embed all input tokens ───
+    int n_gen = 0;
+    for (int i = 0; i < n_input; i++) {
+        int tid = input_ids[i];
+        if (tid < 0 || tid >= V) tid = 0;
+        for (int j = 0; j < H; j++)
+            embed_buf[i * H + j] = fp16_to_fp32(embed_w[tid * H + j]);
+    }
+
+    // Build position array for prefill
+    int* positions = (int*)atlas_valloc((size_t)n_input * sizeof(int));
+    if (!positions) {
+        atlas_vfree((uint8_t*)embed_buf); atlas_vfree((uint8_t*)h_norm);
+        atlas_vfree((uint8_t*)logits); return -1;
+    }
+    for (int i = 0; i < n_input; i++) positions[i] = i;
+
+    // Fused forward for all prompt tokens at once
+    atlas_forward(m, embed_buf, n_input, positions,
+                  k_cache, v_cache, max_seq_len, n_input,
+                  layer_idx, m->n_layers);
+
+    // Final RMSNorm + LM head on all prompt tokens
+    // (extract last token's result for first decode step)
+    for (int i = 0; i < n_input; i++) {
+        const float* x = embed_buf + (int64_t)i * H;
+        atlas_rmsnorm_f32(x, norm_w, h_norm, H, 1e-6f);
+        atlas_lmhead_gemv(m, h_norm, logits, 1);
+        // Only keep result for the last prompt token
+        if (i == n_input - 1) break;
+    }
+
+    // Sample first token from prefill logits
+    int next_token = gumbel_sample(logits, V, temperature, top_k, top_p);
+    output_ids[n_gen++] = next_token;
+
+    if (next_token == 0) {  // EOS
+        atlas_vfree((uint8_t*)embed_buf); atlas_vfree((uint8_t*)h_norm);
+        atlas_vfree((uint8_t*)logits); atlas_vfree((uint8_t*)positions);
+        return n_gen;
+    }
+
+    // ─── Decode loop ───
+    atlas_vfree((uint8_t*)positions);
+    for (int step = 1; step < max_new_tokens; step++) {
+        // Embed last generated token
+        int tid = next_token;
+        if (tid < 0 || tid >= V) tid = 0;
+        float* h = embed_buf;  // reuse embed_buf as single-token buffer
+        for (int j = 0; j < H; j++)
+            h[j] = fp16_to_fp32(embed_w[tid * H + j]);
+
+        int seq_now = n_input + step;
+        int pos = seq_now - 1;
+        atlas_forward(m, h, 1, &pos,
+                      k_cache, v_cache, max_seq_len, seq_now,
+                      layer_idx, m->n_layers);
+
+        atlas_rmsnorm_f32(h, norm_w, h_norm, H, 1e-6f);
+        atlas_lmhead_gemv(m, h_norm, logits, 1);
+
+        next_token = gumbel_sample(logits, V, temperature, top_k, top_p);
+        output_ids[n_gen++] = next_token;
+
+        if (next_token == 0) break;  // EOS
+    }
+
+    atlas_vfree((uint8_t*)embed_buf);
+    atlas_vfree((uint8_t*)h_norm);
+    atlas_vfree((uint8_t*)logits);
+
+    return n_gen;
 }
 
 }  // extern "C"
