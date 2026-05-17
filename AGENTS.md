@@ -31,6 +31,7 @@
   4. `atlas_infer.py`: prefetch was skipped for cached loads. Fixed: always call `atlas_prefetch_int8` regardless of cache source.
   5. `atlas_save_cache`: single `fwrite` of 70 MB+ tensors returned short writes on Windows. Fixed: write in 64 KB chunks.
 - **Cache performance**: 3B load 11.1s→3.5s (3×), 10B load 35.9s→15.3s (2.3×). 10B cache: 8.86 GB.
+- **v1.0.7 mmap + OMP prefetch**: atlas file mmap eliminates all fread for tensor data. OMP parallel prefetch touches 9.5 GB int8 pages across 8 cores. 10B cached load: 15.3s→**3.3s** (4.6×), 7B: 8.1s→**5.5s** (1.5×).
 - **fp16 lm_head RAM fix**: lm_head weight kept as fp16 (768 MB), lazily converted to fp32 on first access. `matmul_f16` uses fast full-size matmul (not chunked) for lm_head; saves 768 MB persistent RAM vs always-fp32. Fixes 10B OOM during warmup.
 
 All with `head_dim=256`, `rope_theta=1000042`, GQA architecture. 1B/3B/10B use `vocab_size=131072`, 7B uses `131080`.
