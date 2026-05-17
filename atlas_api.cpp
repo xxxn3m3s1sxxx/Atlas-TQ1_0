@@ -106,9 +106,13 @@ struct AtlasModel {
     float* buf_out = nullptr;       // [max_batch * hidden_dim] layer output ping-pong for atlas_forward
     int max_batch = 0;
     // mmap cache handles (for int8 data loaded from .i8 file)
-    void* mmap_base = nullptr;      // MapViewOfFile base
+    void* mmap_base = nullptr;      // MapViewOfFile base (.i8 cache)
     void* mmap_handle = nullptr;    // CreateFileMapping handle
     void* mmap_file = nullptr;      // CreateFile handle
+    // mmap atlas file handles (for fp16 tensor data — demand-paged by OS)
+    void* atlas_mmap_base = nullptr;
+    void* atlas_mmap_handle = nullptr;
+    void* atlas_mmap_file = nullptr;
     // Int8 quantized lm_head (per-row symmetric, ~403 MB instead of 1.5 GB fp32)
     int8_t* lm_head_i8 = nullptr;
     int32_t* lm_head_offsets = nullptr;  // precomputed 128 * sum(w) per row
@@ -127,15 +131,29 @@ struct AtlasModel {
     }
 
     bool is_mapped(const uint8_t* ptr) const {
-        if (!mmap_base) return false;
-        int64_t mmap_sz;
+        // Check .i8 cache mmap
+        if (mmap_base) {
+            int64_t mmap_sz;
 #ifdef _WIN32
-        mmap_sz = 0xFFFFFFFF;
+            mmap_sz = 0xFFFFFFFF;
 #else
-        mmap_sz = (int64_t)(intptr_t)mmap_handle;
+            mmap_sz = (int64_t)(intptr_t)mmap_handle;
 #endif
-        return ptr >= (const uint8_t*)mmap_base &&
-               ptr < (const uint8_t*)mmap_base + mmap_sz;
+            if (ptr >= (const uint8_t*)mmap_base &&
+                ptr < (const uint8_t*)mmap_base + mmap_sz) return true;
+        }
+        // Check atlas file mmap
+        if (atlas_mmap_base) {
+            int64_t sz;
+#ifdef _WIN32
+            sz = 0xFFFFFFFF;
+#else
+            sz = (int64_t)(intptr_t)atlas_mmap_handle;
+#endif
+            return ptr >= (const uint8_t*)atlas_mmap_base &&
+                   ptr < (const uint8_t*)atlas_mmap_base + sz;
+        }
+        return false;
     }
 
     void ensure_buffers(int B) {
@@ -203,47 +221,81 @@ ATLAS_API AtlasModel* atlas_load(const char* path) {
         m->tensors[i].packed_cols = e[9] | (e[10]<<8) | (e[11]<<16);
     }
 
-    // Compute actual data sizes from file offsets (next - current, which includes 32-byte padding)
-    auto file_data_size = [&](int i) -> int {
-        if (i + 1 < n_tensors) {
-            int raw = (int)(file_offsets[i + 1] - file_offsets[i]);
-            // Round down to nearest 32 to strip padding
-            return raw - (raw % 32);
-        }
-        // Last tensor: infer from atlas file size
-        FSEEK(f, 0, SEEK_END);
-        int64_t fsize = FTELL(f);
-        return (int)(fsize - (int64_t)file_offsets[i]);
-    };
+    // Compute file size for last-tensor calculation
+    FSEEK(f, 0, SEEK_END);
+    int64_t file_size = FTELL(f);
+    FSEEK(f, 64, SEEK_SET);
 
-    // Load all tensor data
+    // Load all tensor data from mmap'd atlas file
+    // mmap the entire atlas file for zero-copy access to tensor data
+#ifdef _WIN32
+    HANDLE hFileW = (HANDLE)_get_osfhandle(_fileno(f));
+    HANDLE hDup = INVALID_HANDLE_VALUE;
+    DuplicateHandle(GetCurrentProcess(), hFileW, GetCurrentProcess(),
+                    &hDup, FILE_READ_DATA, FALSE, 0);
+    HANDLE hMapW = CreateFileMappingW(hDup, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (hMapW) {
+        uint8_t* map_base = (uint8_t*)MapViewOfFile(hMapW, FILE_MAP_READ, 0, 0, 0);
+        if (map_base) {
+            m->atlas_mmap_base = map_base;
+            m->atlas_mmap_handle = hMapW;
+            m->atlas_mmap_file = (void*)hDup;
+        } else {
+            CloseHandle(hMapW); CloseHandle(hDup);
+        }
+    } else {
+        CloseHandle(hDup);
+    }
+#else
+    int fd = fileno(f);
+    // dup fd so mmap outlives fclose
+    int map_fd = dup(fd);
+    if (file_size > 0 && map_fd >= 0) {
+        uint8_t* map_base = (uint8_t*)mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, map_fd, 0);
+        if (map_base != MAP_FAILED) {
+            m->atlas_mmap_base = map_base;
+            m->atlas_mmap_handle = (void*)(intptr_t)file_size;
+            m->atlas_mmap_file = (void*)(intptr_t)map_fd;
+        } else {
+            close(map_fd);
+        }
+    }
+#endif
+
     for (int i = 0; i < n_tensors; i++) {
         auto& t = m->tensors[i];
-        FSEEK(f, (int64_t)t.file_offset, SEEK_SET);
 
         if (t.ttype == 0) {  // TQ1: 2-byte scale + packed data
             t.data_size = 2 + t.row_dim * t.packed_cols;
         } else if (t.ttype == 1) {  // norm/embed: raw float16
-            // embed: [vocab, hidden]; norm: [hidden]
             if (t.row_dim == m->vocab_size) {
-                t.data_size = t.row_dim * m->hidden_dim * 2;  // fp16
+                t.data_size = t.row_dim * m->hidden_dim * 2;
             } else {
-                t.data_size = t.row_dim * 2;  // fp16 1D
+                t.data_size = t.row_dim * 2;
             }
             t.packed_cols = 0;
-        } else {  // other (lm_head, GQA scales)
-            int actual_bytes = file_data_size(i);
+        } else {  // lm_head / scales
+            int actual_bytes = (i + 1 < n_tensors)
+                ? (int)(file_offsets[i + 1] - file_offsets[i]) - ((int)(file_offsets[i + 1] - file_offsets[i]) % 32)
+                : (int)(file_size - (int64_t)file_offsets[i]);
             int expected = t.row_dim * m->hidden_dim * 2;
             if (actual_bytes < expected && actual_bytes > 0) {
-                t.data_size = actual_bytes;  // GQA scale vector: use real size
+                t.data_size = actual_bytes;
             } else {
-                t.data_size = expected;  // lm_head matrix
+                t.data_size = expected;
             }
             t.packed_cols = 0;
         }
 
-        t.data = atlas_valloc(t.data_size);
-        fread(t.data, 1, t.data_size, f);
+        // Point into mmap'd atlas file instead of fread
+        if (m->atlas_mmap_base) {
+            t.data = (uint8_t*)m->atlas_mmap_base + file_offsets[i];
+        } else {
+            // Fallback: fread into valloc'd buffer (no mmap available)
+            t.data = atlas_valloc(t.data_size);
+            FSEEK(f, (int64_t)file_offsets[i], SEEK_SET);
+            fread(t.data, 1, t.data_size, f);
+        }
     }
 
     fclose(f);
@@ -269,6 +321,17 @@ ATLAS_API void atlas_free(AtlasModel* m) {
 #else
         munmap(m->mmap_base, 0);
         close((int)(intptr_t)m->mmap_file);
+#endif
+    }
+    // Unmap atlas file if loaded
+    if (m->atlas_mmap_base) {
+#ifdef _WIN32
+        UnmapViewOfFile(m->atlas_mmap_base);
+        CloseHandle(m->atlas_mmap_handle);
+        CloseHandle((HANDLE)m->atlas_mmap_file);
+#else
+        munmap(m->atlas_mmap_base, 0);
+        // Don't close fd — atlas_load doesn't dup on Linux (already closed via fclose)
 #endif
     }
     delete m;
@@ -505,16 +568,18 @@ ATLAS_API void atlas_decompress_all(AtlasModel* m) {
 // Touch one byte per 4KB page to force page-in / prevent working-set trim lag.
 ATLAS_API void atlas_prefetch_int8(AtlasModel* m) {
     int64_t total = 0;
-    for (auto& t : m->tensors) {
+    int64_t step = 4096 / sizeof(int8_t);
+    int n = (int)m->tensors.size();
+    #pragma omp parallel for reduction(+:total) schedule(dynamic, 4)
+    for (int ti = 0; ti < n; ti++) {
+        auto& t = m->tensors[ti];
         if (t.ttype != 3) continue;
         int n_vals = t.row_dim * t.packed_cols * 5;
         int8_t* data = (int8_t*)(t.data + 2);
-        volatile int acc = 0;
-        for (int64_t i = 0; i < n_vals; i += 4096 / sizeof(int8_t)) {
-            acc += data[i];
+        for (int64_t i = 0; i < n_vals; i += step) {
+            volatile int sink = data[i]; (void)sink;
         }
         total += n_vals;
-        (void)acc;
     }
     printf("[ATLAS] Prefetched %lld int8 values\n", (long long)total);
 }
@@ -895,12 +960,6 @@ static void matmul_reorder_deq(int rows, int input_dim,
     }
 }
 
-// ─── SiLU (Sigmoid Linear Unit) in-place ─────────────────────────────
-static void silu_inplace(float* x, int n) {
-    for (int i = 0; i < n; i++) {
-        x[i] = x[i] / (1.0f + expf(-x[i]));
-    }
-}
 
 // ─── Internal: forward one transformer layer ──────────────────────────
 // input: [B, H] float32 (read-only, preserved for residual)
@@ -1274,7 +1333,7 @@ ATLAS_API void atlas_quantize_lmhead(AtlasModel* m, int idx) {
         offs[r] = 128 * row_sum;
     }
 
-    atlas_vfree(t.data);
+    if (!m->is_mapped(t.data)) atlas_vfree(t.data);
     t.data = nullptr;
     t.data_size = 0;
 
