@@ -28,10 +28,12 @@
 - **(none)**
 
 ### Blocked
-- **10B coherence test**: 5.7 GB free on C:\ — .i8 cache needs ~9.5 GB. Blocked until disk space freed.
 - **1B greedy degeneration**: Model-inherent (`,` p=0.43). Requires sampling (`T≥0.7`, `top_k=40`, `top_p=0.9`). Not an engine bug.
 - **WSL performance**: ~4–5× slower than native Windows.
 - **8 GB RAM limit**: 10B does not fit on 8 GB machines.
+
+### Fixed
+- **Bug 11 [10B tokenizer_offset int32 overflow]**: `int` (signed 32-bit) für `tokenizer_offset` overflowt bei >2 GB Dateigröße. 10B Offset bei ~3.3 GB → negativ als int32. Fix: `uint32_t` + `ptrdiff_t` cast. Einziger Bug in v1.2.0-pre.
 
 ## Key Decisions
 - **v5 format**: `[header:64] [dir:n*12] [name_block] [token_data...] [tokenizer_block]`. Tokenizer stored as separate raw JSON block (no merge — avoids tokenizers Rust parser corruption). Header bytes 29-32: tokenizer_size, 33-36: tokenizer_offset.
@@ -52,11 +54,11 @@
 - **Prefill is already batched**: `forward()` passes all prompt tokens as B=prompt_len in single `atlas_forward` call. `atlas_attention_f32` handles causal masking per-token within the batch.
 - **Engine correctness**: corr=0.9967 with fixed Python reference. Remaining 0.3% = shared quantization gap.
 - **1B f32 bypass**: Auto-enabled for `hidden <= 2048`. Confirms u8 path is exact (identical argmax).
-- **Benchmarks (v1.1.0, 8 OMP threads, mmap cache, cold start = first load without cache, warm = cached)**:
-  - **1B**: cold=4.5s warm=0.8s load, gen=1.5s (6.7 tok/s)
-  - **3B**: cold=10.1s warm=1.4s load, gen=2.2s (4.5 tok/s)
-  - **7B**: load~7s, gen~5.6s (1.8 tok/s)
-  - **10B**: load~? (3.28 GB .atlas, needs 16 GB RAM), gen~2.1 tok/s
+- **Benchmarks (v1.2.0-pre, 8 OMP threads, mmap cache via atlas_generate single-call)**:
+  - **1B**: load=1.4s, gen=3.6s/30tok (8.3 tok/s)
+  - **3B**: load=? gen=?
+  - **7B**: load=? gen=?
+  - **10B**: load=7.5s, gen=21.1s/30tok (1.4 tok/s) — "The capital of France is Paris." ✅
 - **Memory**: Loading via file mmap (zero-copy). `AtlasModel(model)` = ~200 MB Python + ~1-10 GB C++ (OS-paged from mmap).
 
 ## Relevant Files
