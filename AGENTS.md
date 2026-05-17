@@ -74,7 +74,7 @@ Der `lm_head` Matmul-Block (Vokabular-Projektion) wurde vollständig aus der Pyt
 * **`_matmul_f16` fallback**: auto-detects null tensor data and redirects to GEMV — all existing bench/tools/scripts continue to work.
 * **`atlas_ffi.h` updated**: `atlas_quantize_lmhead(model, idx)` + `atlas_lmhead_gemv(model, act, out, B)`.
 
-### v1.0.5 (current) — Fused Gate/Up FFN Pipeline
+### v1.0.5 — Fused Gate/Up FFN Pipeline
 * Fused sequential `gate_proj` and `up_proj` execution into a single OMP parallel region over 4-row packed groups.
 * Eliminated raw matmul scratch buffer (`buf_hidden`) — inline reorder+dequant writes directly to `buf_gate`/`buf_up`.
 * Shared activation quantization stays hot in L1 cache (no eviction between gate+up).
@@ -90,6 +90,23 @@ Der `lm_head` Matmul-Block (Vokabular-Projektion) wurde vollständig aus der Pyt
 * **Coherence verified**: `"The capital of France is Paris."` — same exact output.
 * No file format change — fully backward compatible with v1.0.4 `.atlas` files.
 
+### v1.0.6 (current) — Fused SiLU+MUL+Quantize Pipeline
+* Eliminated four separate RAM passes (silu_inplace → mul → copy → quantize) into a single two-pass-per-token kernel.
+* `silu_inplace()` removed — SiLU computed inline during fused pass.
+* buf_hidden removed from the critical path — result written directly to buf_act.
+* **Benchmark (10B):**
+
+| Metrik | v1.0.5 (separat) | v1.0.6 (fused) | Δ |
+|--------|:-:|:-:|:-:|
+| C++ layers total | 554.9 ms | **454.8 ms** | **−100 ms (18.0%)** |
+| Per-layer mean | 13.9 ms | **11.4 ms** | **−2.5 ms** |
+| Full decode step | ~576 ms | **~473 ms** | **−103 ms (17.9%)** |
+
+**Decode Rate: 2.1 tok/s**
+
+* **Coherence verified**: 3B `"Hello! How can I assist you today?"`, 10B `'Paris'`.
+* No file format change — fully backward compatible.
+
 ### Blocked
 - **7B model**: safetensors not present on this machine. Only GGUF variant exists.
 
@@ -104,10 +121,10 @@ Der `lm_head` Matmul-Block (Vokabular-Projektion) wurde vollständig aus der Pyt
 - **Int8 lm_head**: per-row symmetric quantization with float dequant scales. Stored separately from TensorInfo (not in cache). Frees fp16 data on quantize. Fallback path in `_matmul_f16` for backward compat.
 
 ## Next Steps
-1. **v1.0.4 release**: tag and GitHub release with int8 lm_head GEMV.
-2. **7B enablement**: with −1.1 GB RAM, 7B (8.9 GB → ~7.8 GB) may now fit on 8 GB systems. Test if possible.
-3. **Test on native Linux hardware** for reliable cross-platform numbers.
-4. **Simplify installation**: PyPI package, single-command install, auto-download prebuilt binaries.
+1. **7B enablement (re-evaluate)**: with int8 lm_head + fused SiLU, RAM ~8.4 GB. 7B safetensors needed.
+2. **Test on native Linux hardware** for reliable cross-platform numbers.
+3. **Simplify installation**: PyPI package, single-command install, auto-download prebuilt binaries.
+4. **Expand int8 mmap cache** to cover fp16 tensors (embed, norms) → sub-second load.
 5. **Port to Mojo / Rust / Zig** — after C++ kernel is confirmed as pure source of truth on both Windows + Linux.
 
 ## Relevant Files
