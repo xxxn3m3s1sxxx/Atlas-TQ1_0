@@ -5,6 +5,7 @@
 #include <cstring>
 #include <cmath>
 #include <vector>
+#include <string>
 #include <immintrin.h>
 
 #ifdef _WIN32
@@ -138,6 +139,9 @@ struct AtlasModel {
     void* atlas_mmap_handle = nullptr;  // CreateFileMapping handle (Win) / file size (Lin)
     void* atlas_mmap_file = nullptr;    // duplicated fd (Win: HANDLE, Lin: fd)
     size_t atlas_mmap_size = 0;        // actual file size for range checks
+    // Embedded tokenizer data (v5+)
+    int tokenizer_size = 0;
+    int tokenizer_offset = 0;
     // Int8 quantized lm_head (per-row symmetric, ~403 MB instead of 1.5 GB fp32)
     int8_t* lm_head_i8 = nullptr;
     int32_t* lm_head_offsets = nullptr;  // precomputed 128 * sum(w) per row
@@ -215,10 +219,15 @@ ATLAS_API AtlasModel* atlas_load(const char* path) {
         m->rope_theta = 10000.0f;  // default for old files
     }
 
-    printf("[ATLAS] v%d model: %dL %dH %dI %d/%d heads %d vocab %.0f theta | %d tensors\n",
+    // v5+ tokenizer header fields
+    memcpy(&tmp32, hdr+29, 4); m->tokenizer_size = (int)tmp32;
+    memcpy(&tmp32, hdr+33, 4); m->tokenizer_offset = (int)tmp32;
+
+    printf("[ATLAS] v%d model: %dL %dH %dI %d/%d heads %d vocab %.0f theta | %d tensors %s\n",
            version,
            m->n_layers, m->hidden_dim, m->inter_dim, m->n_heads, m->n_kv_heads,
-           m->vocab_size, m->rope_theta, n_tensors);
+           m->vocab_size, m->rope_theta, n_tensors,
+           m->tokenizer_size > 0 ? "(embedded tokenizer)" : "");
 
     // Read directory
     m->tensors.resize(n_tensors);
@@ -422,6 +431,15 @@ ATLAS_API int atlas_get_tensor_name(AtlasModel* m, int idx, char* buf, int buf_s
     memcpy(buf, s.data(), copy);
     buf[copy] = '\0';
     return copy;
+}
+
+// ─── Embedded tokenizer API (v5+) ────────────────────────────────────
+ATLAS_API const uint8_t* atlas_get_tokenizer(AtlasModel* m, int* size) {
+    if (!m || !m->tokenizer_size || !m->atlas_mmap_base) {
+        if (size) *size = 0; return nullptr;
+    }
+    if (size) *size = m->tokenizer_size;
+    return (const uint8_t*)m->atlas_mmap_base + m->tokenizer_offset;
 }
 
 ATLAS_API int atlas_get_tensor_index(AtlasModel* m, const char* name) {

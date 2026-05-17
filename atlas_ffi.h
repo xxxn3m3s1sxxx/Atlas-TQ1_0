@@ -12,9 +12,13 @@
 //   [15:2]  uint16 head_dim
 //   [17:4]  uint32 vocab_size (int32)
 //   [21:8]  float64 rope_theta (version>=3), else 10000.0
+//   [29:4]  int32  tokenizer_size (v5+), 0 if no embedded tokenizer
+//   [33:4]  int32  tokenizer_offset (v5+), absolute file offset
+//   [56:4]  int32  name_block_size (v4+)
 //   [60:4]  int32  n_tensors
 //   [64:]   tensor directory: n × [ttype:1][file_offset:4][row_dim:4][packed_cols:3]
-//   then tensor data at each file_offset (32-byte aligned)
+//   then name block, then tensor data at each directory file_offset
+//   (v5+: tokenizer data appended after tensor data, at tokenizer_offset)
 //
 // Int8 cache format (.i8 companion file)
 //   [0:4]     int32 n_tensors (must match atlas n_tensors)
@@ -88,6 +92,12 @@ ATLAS_API int atlas_get_tensor_name(void* model, int idx, char* buf, int buf_siz
 
 // Find tensor index by exact name match. Returns -1 if not found.
 ATLAS_API int atlas_get_tensor_index(void* model, const char* name);
+
+// ─── Embedded tokenizer (v5+) ──────────────────────────────────────────
+// Get embedded tokenizer data (JSON). Returns pointer to raw bytes or NULL.
+// size: set to tokenizer length in bytes, or 0 if not available.
+// Pointer is valid until atlas_free. Data is mmap'd from atlas file.
+ATLAS_API const uint8_t* atlas_get_tokenizer(void* model, int* size);
 
 // ─── Decompression + cache ────────────────────────────────────────────
 // Decompress all TQ1 tensors (ttype==0) to int8 (ttype==3) in-place.

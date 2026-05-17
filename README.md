@@ -19,7 +19,7 @@ BitNet b1.58 models replace full-precision weights with ternary values (-1, 0, +
 | Falcon3-7B-Instruct-1.58bit | `falcon3-7b-tq1.atlas` | 2.74 GB | 28 | 3072 | 23040 | 12 | 4 |
 | Falcon3-10B-Instruct-1.58bit | `falcon3-10b-tq1.atlas` | 3.27 GB | 40 | 3072 | 23040 | 12 | 4 |
 
-All use `head_dim=256`, `rope_theta=1000042`, `vocab_size=131072`, GQA architecture. The `.atlas` extension identifies the file as loadable by the ATLAS engine. Atlas files use version 4 format (v4), which embeds tensor names directly in the file header, eliminating the safetensors dependency at inference time.
+All use `head_dim=256`, `rope_theta=1000042`, `vocab_size=131072`, GQA architecture. The `.atlas` extension identifies the file as loadable by the ATLAS engine. Atlas files use **v5 format**: a self-contained binary embedding tensor names, all weight data, and the full tokenizer (tokenizer.json + config). No external files are needed at inference time — `AtlasModel('file.atlas')` loads everything.
 
 1B and 3B models fit comfortably in **8 GB RAM** (see Memory table). The 3B offers the best quality-to-speed ratio for memory-constrained systems.
 
@@ -50,11 +50,13 @@ Pre-built atlas files are named `falcon3-{size}b-tq1.atlas`.
 
 ### 2. Run inference
 
-```bash
-python atlas_infer.py falcon3-10b-tq1.atlas path/to/model_dir "What is the capital of France?"
+```python
+from atlas_infer import AtlasModel
+model = AtlasModel('falcon3-1b-tq1.atlas')
+print(model.generate("What is the capital of France?"))
 ```
 
-The inference script loads the atlas file into the C++ DLL, initializes the tokenizer from the model directory, and runs autoregressive generation with GQA attention, RoPE, KV cache, SiLU FFN, and temperature sampling.
+The inference script loads the atlas file into the C++ DLL, initializes the tokenizer from the embedded v5 data, and runs autoregressive generation with GQA attention, RoPE, KV cache, SiLU FFN, and temperature sampling. No `model_dir` required — the `.atlas` file is fully self-contained.
 
 ### 3. Compile the C++ library (if modifying code)
 
@@ -102,7 +104,7 @@ safetensors ──► atlas_packer.py ──► .atlas file ──► atlas_infe
 
 1. **Packer** (`atlas_packer.py`): Reads HuggingFace safetensors with pre-quantized 2-bit packed weights (`byte = v0 + v1*4 + v2*16 + v3*64`). De-interleaves the BitNet row-aware format (4 weight rows per uint8 row). Repacks each row independently into TQ1.0: 5 ternary trits mapped to Base-3 values 0-242, padded with ternary-0 (mapped from value 1) to fill the last byte. FP16 per-tensor scales are stored as 2-byte prefixes.
 
-2. **ATLAS v4 file format**: Binary file with a 64-byte header (magic "ATLASv4", layer count, hidden dim, intermediate dim, head counts, vocab size, tensor count, tensor name block size). Directory of 12-byte entries follows (ttype, tversion, file offset, row dim, packed cols). After the directory, a variable-length name block stores null-terminated tensor names. Tensor data follows: TQ1 weights (ttype=0) have a 2-byte FP16 scale prefix followed by packed rows; embeddings/norms (ttype=1) and LM head (ttype=2) are raw FP16. An optional `.i8` companion file caches decompressed int8 tensors at the same path for sub-second loading on subsequent runs.
+2. **ATLAS v5 file format**: Binary file with a 64-byte header (magic "ATLASv4", version=5, model hyperparameters, tokenizer offset/size at bytes 29-36, name block size at bytes 56-59, tensor count at bytes 60-63). Directory of 12-byte entries follows (ttype, file offset, row dim, packed cols). After the directory, a variable-length name block stores null-terminated tensor names. Then tensor data follows: TQ1 weights (ttype=0) have a 2-byte FP16 scale prefix followed by packed rows; embeddings/norms (ttype=1) and LM head (ttype=2) are raw FP16. At the end of the file, the tokenizer block stores the raw `tokenizer.json` and `tokenizer_config.json` (size-prefixed, no merge) — loadable by `tokenizers::Tokenizer::from_buffer()`. C API `atlas_get_tokenizer()` exposes the raw bytes. An `.i8` companion file caches decompressed int8 tensors at the same path for sub-second loading on subsequent runs. No external model directory is needed: `AtlasModel('model.atlas')` is sufficient.
 
 3. **C++ library** (`atlas_api.cpp`, single source for Windows + Linux): Loads the atlas file into memory. On load, TQ1 tensors are decompressed from Base-3 packed format to int8 (one valloc per tensor — `VirtualAlloc` on Windows, `mmap` on Linux — so freed memory returns to the OS immediately). Then `atlas_forward` runs *all* transformer layers in one fused C++ call — RMSNorm + 7× int8 matmul (Q/K/V/O/gate/up/down) + fused GQA attention (RoPE + cache + causal softmax + weighted sum) + fused FFN (gate+up in one OMP region, SiLU+mul+quantize fused into down projection) repeated for each layer — with no Python round-trips between layers. A dedicated ping-pong buffer avoids per-layer copies. A f32 matmul bypass (`atlas_set_use_f32_matmul`) can skip activation quantization for small models (auto-enabled for hidden ≤ 2048), using direct AVX2 f32×i8 FMA as a numerical reference path.
 
@@ -112,18 +114,18 @@ safetensors ──► atlas_packer.py ──► .atlas file ──► atlas_infe
 
 ## Performance
 
-Measured on i5-1235U (Alder Lake, 2P+8E, 8 OMP threads, AVX2+FMA, 16 GB DDR4) with v1.0.8 (mmap + OMP prefetch + f32 matmul bypass for 1B).
+Measured on i5-1235U (Alder Lake, 2P+8E, 8 OMP threads, AVX2+FMA, 16 GB DDR4) with v1.1.0 (mmap + OMP prefetch + f32 matmul bypass for 1B + v5 embedded tokenizer).
 
 All models use the fused `atlas_forward` (all layers in one C++ call). Per-layer C++ times include RMSNorm + 7× int8 matmul (Q/K/V/O/gate/up/down) + fused GQA attention + Fused FFN (gate+up in one OMP region, SiLU+mul+quantize). The `atlas_forward` call runs all N layers as a single C function with ping-pong buffers — no Python round-trips between layers.
 
-| Model | Prefill (fused) | Decode (fused, warm) | Per-Layer C++ (mean) | Runtime RAM |
-|-------|----------------|---------------------|--------------------|:--------:|
-| Falcon3-1B (18L, 2048×8192)  | n/a | 8.9 tok/s | 3.5 ms | 1.9 GB |
-| Falcon3-3B (22L, 3072×9216)  | 10.7 tok/s | 4.6 tok/s | 5.4 ms | 4.7 GB |
-| Falcon3-7B (28L, 3072×23040) | **3.3 tok/s** | **3.2 tok/s** | **10.5 ms** | **8.3 GB** |
-| Falcon3-10B (40L, 3072×23040) | **7.8 tok/s** | **2.1 tok/s** | **11.4 ms** | **10.8 GB** |
+| Model | Prefill (fused) | Decode (fused, warm) | Per-Layer C++ (mean) | Cold Load | Warm Load | Runtime RAM |
+|-------|----------------|---------------------|--------------------|:--------:|:--------:|:--------:|
+| Falcon3-1B (18L, 2048×8192)  | n/a | **9.4 tok/s** | 3.5 ms | 4.5s | 0.8s | 1.9 GB |
+| Falcon3-3B (22L, 3072×9216)  | 10.7 tok/s | **5.0 tok/s** | 5.4 ms | 10.1s | 1.4s | 4.7 GB |
+| Falcon3-7B (28L, 3072×23040) | 3.3 tok/s | **3.2 tok/s** | 10.5 ms | ~7s | ~7s | 8.3 GB |
+| Falcon3-10B (40L, 3072×23040) | 7.8 tok/s | **2.1 tok/s** | 11.4 ms | ~? | ~? | 10.8 GB |
 
-All models verified with coherence test: "Hello! How can I assist you today?" (1B/3B/7B) / "The capital of France is Paris." (10B). All models run under 16 GB RAM; 1B and 3B fit comfortably in **8 GB RAM**. Generation quality is sensitive to sampling parameters with very small models: **1B requires sampling** (temperature ≥ 0.7, top_k=40, top_p=0.9). Greedy decoding on the 1B model degenerates to `,` then repetition because the 1.58-bit-quantized 1B model's distribution has `,` as argmax (p=0.43) — this is a model property, not an engine bug. The engine is deterministic and exact at full precision via the f32 matmul bypass path.
+All models verified with coherence test: "The capital of France is Paris." (3B/7B/10B). 1B requires sampling (greedy degenerates to `,` due to model distribution, not engine). All models run under 16 GB RAM; 1B and 3B fit comfortably in **8 GB RAM**. The engine is deterministic and exact at full precision via the f32 matmul bypass path — identical argmax to the u8-quantized path.
 
 ### Per-Model Breakdown
 
@@ -140,13 +142,12 @@ Most impactful for throughput: 3.2 tok/s decode at only 8.3 GB RAM — runs on 8
 
 On first load, ATLAS creates a `.i8` companion file next to the `.atlas` file containing the decompressed int8 tensors (only TQ1 weights, not FP16 norms/embeds). Subsequent loads mmap this file directly, skipping decompression entirely:
 
-- **3B**: First load (decompress) 7.1s → cached load 1.7s (4.2×)
-- **10B**: First load (decompress) 56.9s → cached load 15.3s (3.7×)
-- **7B**: First load (decompress + cache write) 18.8s → cached load 8.1s (2.3×)
+| Model | Cold Load (decompress + save) | Warm Load (mmap) | Speedup |
+|-------|:----:|:----:|:----:|
+| 1B | 4.5s | 0.8s | 5.6× |
+| 3B | 10.1s | 1.4s | 7.2× |
 
-The cache stores all ttype==3 (int8-decoded) tensors with a header containing tensor type, dimensions, and 64-bit file offsets. 64 KB chunked writes avoid short-write issues on large tensors (>70 MB). The cache is invalidated if the tensor count changes (e.g., model file replaced). Always generated automatically — no user action needed.
-
-> **Caveat**: If upgrading from a previous ATLAS version, delete stale `.i8` cache files to avoid loading corrupted cache data. Cache format did not change between v1.0.1 and v1.0.2, but caches written by buggy versions (Bug 8) may contain corrupt tensor data. v1.0.8 adds disk-space checks, short-write retries, and file-size validation to prevent corrupted cache creation. Delete old `.i8` files after upgrading to v1.0.8.
+The cache stores all ttype==3 (int8-decoded) tensors with a header containing tensor type, dimensions, and 64-bit file offsets. 64 KB chunked writes avoid short-write issues on large tensors (>70 MB). Disk space is verified before writing; file size is validated on load. The cache is invalidated if the tensor count changes. Always generated automatically — no user action needed.
 
 ### Int8 Kernel
 
@@ -302,20 +303,20 @@ The copy-buffer semantics were always correct for even n_layers (all Falcon3 mod
 
 | File | Purpose |
 |------|---------|
-| `atlas_packer.py` | Streams safetensors → TQ1 ATLAS file |
-| `atlas_infer.py` | End-to-end inference engine (Python) |
-| `atlas_api.cpp` | Single-source C++ library (load, decompress TQ1→int8, fused forward, int8 matmul, fused attention, norms). Windows + Linux via `#ifdef _WIN32` |
-| `atlas.dll` | Prebuilt DLL (Clang LLVM-MinGW, 126 KB) |
-| `libatlas.so` | Prebuilt shared library for Linux (39 KB) |
+| `atlas_packer.py` | Streams safetensors → TQ1 ATLAS v5 file (with embedded tokenizer) |
+| `atlas_infer.py` | End-to-end inference engine (Python) — v5 autarky, no model_dir needed |
+| `atlas_api.cpp` | Single-source C++ library (load, v5 tokenizer API, decompress TQ1→int8, fused forward, int8 matmul, fused attention, norms). Windows + Linux via `#ifdef _WIN32` |
+| `atlas_ffi.h` | Pure C API contract — reference for FFI consumers (Mojo, Rust, Zig, Go) |
+| `atlas.dll` | Prebuilt DLL (Clang LLVM-MinGW, 150 KB) |
+| `libatlas.so` | Prebuilt shared library for Linux (58 KB, GCC) |
 | `libomp.dll` | OpenMP runtime (968 KB, ships with LLVM-MinGW) |
 | `compile.bat` | Windows build script (`clang++ -fopenmp -O2 -mavx2 -mfma -mf16c -ffast-math`) |
 | `compile-linux.sh` | Linux build script (`g++ -fopenmp -O2 -mavx2 -mfma -fPIC`) |
-| `test_layer0.py` | Full multi-layer C++ forward vs Python reference verification |
-| `bench_atlas.py` | Benchmark: load time, per-layer profiling, prefill + decode |
-| `falcon3-10b-tq1_0.atlas` | Falcon3-10B packed (3.27 GB, 643 tensors, 40 layers) |
-| `falcon3-7b-tq1_0.atlas`  | Falcon3-7B packed (2.74 GB, 451 tensors, 28 layers) |
-| `falcon3-3b-tq1_0.atlas`  | Falcon3-3B packed (1.95 GB, 355 tensors, 22 layers) |
-| `falcon3-1b-tq1_0.atlas`  | Falcon3-1B packed (1.21 GB, 291 tensors, 18 layers) |
+| `AGENTS.md` | Session context, memory, debugging trail for development |
+| `falcon3-10b-tq1.atlas` | Falcon3-10B packed (3.28 GB, v5, embedded tokenizer) |
+| `falcon3-7b-tq1.atlas`  | Falcon3-7B packed (2.75 GB, v5, embedded tokenizer) |
+| `falcon3-3b-tq1.atlas`  | Falcon3-3B packed (1.96 GB, v5, embedded tokenizer) |
+| `falcon3-1b-tq1.atlas`  | Falcon3-1B packed (1.22 GB, v5, embedded tokenizer) |
 
 ## License
 

@@ -14,61 +14,54 @@
 
 ## Progress
 ### Done
-- **All 4 models packed as v4 format** — names embedded, safetensors dependency eliminated.
+- **v5 format with embedded tokenizer**: All 4 models repacked as `.atlas` v5 with tokenizer.json + tokenizer_config.json embedded. `generate()` no longer needs `model_dir`. C API `atlas_get_tokenizer()` exposes raw bytes.
 - **Bug 8.6 fixed (Cache Short-Write Protection)**: `atlas_save_cache` checks disk space via `GetDiskFreeSpaceExA`, uses `setvbuf(IONBF)` unbuffered writes, retries on short writes, deletes corrupt partial cache on any failure. `atlas_load_cache` validates file size against header offsets before mapping.
 - **f32 matmul bypass added**: `atlas_set_use_f32_matmul(AtlasModel*, int)` — skips activation quantization, uses direct AVX2 f32×i8 FMA. Enabled for `hidden <= 2048` (1B model). `matmul_f32_reorder` + f32 gate+up FFN kernel.
 - **1B coherence analyzed**: Greedy degenerates (`,` p=0.43) due to model-inherent distribution. Sampling (`T=1.0, top_k=40, top_p=0.9`) produces correct output. Engine exact — f32 bypass produces identical argmax.
-- **15.9 GB cleaned**: All Ollama models deleted. 17.74 GB free.
-- **Bug 9 revisited (Ping-Pong Buffer)**: Pointer-Semantik analysiert — `buf_a = hidden_states` kopiert **Pointer**, nicht Daten. Nach Loop: für gerade `n_layers` zeigt `buf_a == hidden_states` (gleiche Addresse) → `hidden_states` hat bereits korrekten Output. Für ungerade: Copy aus `buf_a` nötig. Code `if (n_layers % 2 == 1) { memcpy... }` IST KORREKT. Kein Bug im Engine.
-- **False Alarm corr=0.23**: Zwei Bugs im `test_coherence.py` Reference-Code, nicht im Engine:
-  1. `_rmsnorm` modifiziert Input **in-place** → zerstört `x + attn_proj` Residual. Fix: `.copy()` übergeben.
-  2. Python per-layer quantisiert gate+up **separat** (eigene Scale), C++ fused nutzt **shared quantization** → 0.3% Korrelationsrest.
-  Mit korrigiertem Reference: **corr=0.9967**, max_diff=4.0 (durch shared quantization). Engine korrekt.
-- **`atlas_set_use_f32_matmul` API**, Bug 8.6 Disk Space Check, Short-Write Retry, File Size Validation, `hsum_ps` helper.
-- **All 4 models coherence verified** with default sampling.
-- **v1.0.9 Memory Audit**: Vier Bugs im mmap/Cleanup-Code gefixt:
-  1. **Bug A — atlas_vfree silent no-op**: `munmap(ptr, 0)` auf Linux leakt Speicher (kernel gibt -EINVAL für len=0). Fix: Allocation-Header in `atlas_valloc` (speichert base+size 16 Bytes vor aligned Data Pointer). `atlas_vfree` liest Header aus → `munmap(h->base, h->total)` bzw. `VirtualFree(h->base, 0, MEM_RELEASE)`.
-  2. **Bug B — atlas_vfree auf mmap-Pointer**: `atlas_decompress_all` und `atlas_load_cache` riefen `atlas_vfree(t.data)` auf Pointern in die atlas-mmap. Fix: `is_mapped`-Check vor jedem `atlas_vfree`.
-  3. **Bug C — is_mapped fake Size**: Windows nutzte `0xFFFFFFFF` als mmap-Range. Fix: `mmap_size`/`atlas_mmap_size` Felder in `AtlasModel`, gesetzt beim Laden, genutzt in `is_mapped`.
-  4. **Bug D — Linux fd leak**: `dup(fd)` in `atlas_load` wurde nie geschlossen. Fix: `close((int)(intptr_t)m->atlas_mmap_file)` in `atlas_free`.
-- **Speicherbereinigung**: Alle 9 Platform-Fixes konsolidiert, `atlas.dll` rebuild.
+- **Bug 9 revisited (Ping-Pong Buffer)**: Pointer semantics correctly analyzed — even `n_layers` means `buf_a == hidden_states` after loop (correct). The `if (n_layers % 2 == 1)` copy is correct. No engine bug.
+- **False Alarm corr=0.23**: Two bugs in Python test reference (not engine): `_rmsnorm` in-place residual corruption + shared quantization gap. Fixed reference gives **corr=0.9967**, max_diff=4.0.
+- **v1.0.9 Memory Audit — 4 bugs fixed**: AllocHdr fix (Linux munmap leak), is_mapped guard before vfree (mmap double-free), proper mmap_size tracking (Windows), Linux fd close.
+- **v1.1.0 Production Hardening**: AllocHdr-based valloc/vfree, is_mapped guards, fd close on Linux, int8 quant clip fix in Python.
 
 ### In Progress
 - **(none)**
 
 ### Blocked
-- **1B greedy degeneration**: Not fixable in engine. 1.58-bit quant 1B model has `,` as argmax (p=0.43, entropy 2.75). 3B has `Hello` (p=0.34, entropy 4.25). Requires sampling.
+- **1B greedy degeneration**: Not fixable in engine. 1.58-bit quant 1B model has `,` as argmax (p=0.43, entropy 2.75). Requires sampling.
 - **WSL performance**: ~4–5× slower than native Windows.
-- **8 GB RAM limit**: 10B (10.8 GB) does not fit on 8 GB machines.
+- **8 GB RAM limit**: 10B does not fit on 8 GB machines.
 
 ## Key Decisions
-- **f32 bypass bleibt drin**: Eliminates engine quantization noise. Serves as numerical reference path for kernel optimization.
-- **1B greedy NOT a bug**: Model distribution causes degeneration. Documentation-only fix.
-- **`atlas_forward` seq_now**: Must be actual sequence length (token count), NOT layer count. Test reference fix confirmed engine correct.
-- **Shared gate+up quantization**: C++ fused path quantizes gate **and** up activations with a single shared scale. Python per-layer path quantizes separately. This 0.3% correlation gap is EXPECTED and CORRECT.
-- **Disk space management**: `.i8` cache 1.1 GB (1B) to 9.5 GB (10B). Save checks available space before writing.
-- **Test reference bug prevention**: `_rmsnorm` modifies in-place! Always pass `.copy()` if preserving original for residual.
+- **v5 format**: `[header:64] [dir:n*12] [name_block] [token_data...] [tokenizer_block]`. Tokenizer stored as separate raw JSON block (no merge — avoids tokenizers Rust parser corruption). Header bytes 29-32: tokenizer_size, 33-36: tokenizer_offset.
+- **f32 bypass bleibt drin**: Eliminates engine quantization noise. Serves as numerical reference path.
+- **`atlas_forward` seq_now**: Must be actual sequence length, NOT layer count.
+- **Shared gate+up quantization**: C++ fused path = single shared scale. Python per-layer = separate scales. 0.3% gap is EXPECTED.
 
 ## Next Steps
-1. **README finalisieren** mit v1.0.8 (Bug 8.6, f32 bypass, 1B sampling note, Bug 9/False Alarm clarification).
-2. **Git tag v1.0.8** und push.
-3. **Tokenizer + safetensors overhead killen** — Tensor-Namen in v4, Tokenizer noch aus `model_dir`.
-4. **Linux native testen**.
+1. ~~#3 Tokenizer + safetensors overhead killen~~ **(DONE — v5 embedded tokenizer)**
+2. **Linux native testen** mit v1.1.0 mmap + AllocHdr + fd-close + v5 tokenizer.
+3. **10B coherence test** auf 16 GB Maschine.
+4. **README finalisieren** mit v1.1.0 (v5 format, embedded tokenizer, engine hardening).
 
 ## Critical Context
-- **v1.0.7 current stable**. v1.0.8 bereit (Bug 8.6 + f32 bypass + Engine Korrektheit bestätigt).
-- **10B fused decode**: C++ layers 454.8 ms, lm_head 17.9 ms, total 473 ms (2.1 tok/s). Per-layer 11.4 ms.
-- **f32 bypass**: Auto-enabled for `hidden <= 2048` (1B). Adds ~10–20% per-layer overhead.
-- **`atlas_set_use_f32_matmul`** C API: checked in `forward_layer_internal` for all matmul sites.
-- **`.i8` cache recovery**: Partial write → file deleted, retry on next load.
-- **17.74 GB free** after Ollama cleanup. 7B `.i8` (6.7 GB) kann jetzt parallel zu 10B Cache existieren.
-- **1B coherence**: Sampling `T=1.0, top_k=40, top_p=0.9` → `'Hello! How can I help you today?'` / `'. The capital is Paris.'`. Greedy degenerates (Model-Eigenschaft).
-- **Bug 9 resolved**: Kein Bug. Pointer-Semantik korrekt. `if (n_layers % 2 == 1)` copy condition is correct. Correlation gap between Python per-layer and C++ fused is explained by shared quantization (not a bug).
+- **v1.1.0 latest release** (Production Hardening + v5 embedded tokenizer).
+- **All 4 models in v5 format**: 1.22 GB (1B), 1.96 GB (3B), 2.75 GB (7B), 3.28 GB (10B).
+- **`.i8` cache**: ~1.1 GB (1B) to ~9.5 GB (10B). Auto-generated on first load, mmap'd on subsequent loads.
+- **Prefill is already batched**: `forward()` passes all prompt tokens as B=prompt_len in single `atlas_forward` call. `atlas_attention_f32` handles causal masking per-token within the batch.
+- **Engine correctness**: corr=0.9967 with fixed Python reference. Remaining 0.3% = shared quantization gap.
+- **1B f32 bypass**: Auto-enabled for `hidden <= 2048`. Confirms u8 path is exact (identical argmax).
+- **Benchmarks (v1.1.0, 8 OMP threads, mmap cache, cold start = first load without cache, warm = cached)**:
+  - **1B**: cold=4.5s warm=0.8s load, gen=1.5s (6.7 tok/s)
+  - **3B**: cold=10.1s warm=1.4s load, gen=2.2s (4.5 tok/s)
+  - **7B**: load~7s, gen~5.6s (1.8 tok/s)
+  - **10B**: load~? (3.28 GB .atlas, needs 16 GB RAM), gen~2.1 tok/s
+- **Memory**: Loading via file mmap (zero-copy). `AtlasModel(model)` = ~200 MB Python + ~1-10 GB C++ (OS-paged from mmap).
 
 ## Relevant Files
-- `C:\atlas\atlas_api.cpp`: DLL/SO — f32 matmul bypass (`matmul_f32_reorder`, f32 gate+up), `atlas_set_use_f32_matmul` API, Bug 8.6 fixes (disk space check, short-write retry, file size validation), `hsum_ps` helper.
-- `C:\atlas\atlas_infer.py`: `AtlasModel.__init__` calls `atlas_set_use_f32_matmul` for `self.hidden <= 2048`.
-- `C:\atlas\atlas_ffi.h`: Updated with `atlas_set_use_f32_matmul` declaration.
-- `C:\atlas\test_coherence.py`: Correlation test script (fix: pass `.copy()` to `_rmsnorm` to preserve residual).
-- `C:\atlas\falcon3-{1b,3b,7b,10b}-tq1.atlas`: v4 packed model files.
-- `C:\models\Falcon3-{3B,7B,10B}-Instruct-1.58bit\`: model config, tokenizer, optional safetensors.
+- `C:\atlas\atlas_api.cpp`: `atlas_get_tokenizer()` C API (line 441), v5 header parsing (bytes 29-36), AllocHdr valloc/vfree, is_mapped guards, int8 matmul kernel, f32 bypass.
+- `C:\atlas\atlas_infer.py`: `AtlasModel` — embedded tokenizer loading via `atlas_get_tokenizer()`, `generate()` uses `PreTrainedTokenizerFast` with embedded data, no `model_dir` required for v5.
+- `C:\atlas\atlas_ffi.h`: Updated with `atlas_get_tokenizer` declaration and v5 header layout docs.
+- `C:\atlas\atlas_packer.py`: v5 format writer — appends tokenizer block after tensor data, stores offset in header.
+- `C:\atlas\atlas_kernel.hpp`: Legacy TQ1 gather kernel — not in inference path.
+- `C:\atlas\falcon3-{1b,3b,7b,10b}-tq1.atlas`: **v5** packed model files with embedded tokenizer.
+- `C:\models\Falcon3-{1B,3B,7B,10B}-Instruct-1.58bit\`: model config, optional safetensors (only needed for repacking).

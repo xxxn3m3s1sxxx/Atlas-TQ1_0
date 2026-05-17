@@ -77,11 +77,27 @@ def create_atlas_from_config(safetensors_path, output_path):
 
     print(f"  Scales loaded: {len(scales)}")
 
+    # Load tokenizer.json + tokenizer_config.json for embedding (v5+)
+    # Format: [tokenizer_json_size:4][tokenizer_json bytes][config_json_size:4][config_json bytes]
+    tokenizer_block = b''
+    tokenizer_path = os.path.join(model_dir, 'tokenizer.json')
+    if os.path.exists(tokenizer_path):
+        with open(tokenizer_path, 'rb') as tf:
+            tok_data = tf.read()
+        tokenizer_block += struct.pack('<I', len(tok_data)) + tok_data
+        cfg_path = os.path.join(model_dir, 'tokenizer_config.json')
+        cfg_data = b''
+        if os.path.exists(cfg_path):
+            with open(cfg_path, 'rb') as cf:
+                cfg_data = cf.read()
+        tokenizer_block += struct.pack('<I', len(cfg_data)) + cfg_data
+        print(f"  Tokenizer: {len(tokenizer_block)/1024/1024:.1f} MB (json={len(tok_data)/1024/1024:.1f} MB, config={len(cfg_data)/1024/1024:.1f} MB)")
+
     with open(output_path, 'wb') as out:
         n_tensors = len(names)
         header = bytearray(64)
         header[0:5] = b'ATLAS'
-        struct.pack_into('<H', header, 5, 4)  # v4: added tensor names
+        struct.pack_into('<H', header, 5, 5)  # v5: embedded tokenizer
         struct.pack_into('<H', header, 7, n_layers)
         struct.pack_into('<H', header, 9, hidden)
         struct.pack_into('<H', header, 11, inter)
@@ -147,8 +163,22 @@ def create_atlas_from_config(safetensors_path, output_path):
                 if idx % 16 == 0:
                     print(f"  [{idx}/{len(names)}] {name[:55]:55s} {len(data_bytes)/1024:7.1f}KB")
 
+        # Append tokenizer block at end of file (v5+)
+        if tokenizer_block:
+            tokenizer_offset = current_offset
+            if tokenizer_offset % 32 != 0:
+                pad = 32 - (tokenizer_offset % 32)
+                tokenizer_offset += pad
+                out.write(b'\x00' * pad)
+            out.write(tokenizer_block)
+            current_offset = tokenizer_offset + len(tokenizer_block)
+            struct.pack_into('<I', header, 29, len(tokenizer_block))
+            struct.pack_into('<I', header, 33, tokenizer_offset)
+
         out.seek(64)
         out.write(directory)
+        out.seek(0)
+        out.write(header)
 
     total_gb = current_offset / 1024**3
     print(f"[ATLAS] Done! {total_gb:.2f} GB")

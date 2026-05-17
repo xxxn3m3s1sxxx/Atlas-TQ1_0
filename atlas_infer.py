@@ -101,6 +101,9 @@ dll.atlas_get_tensor_name.argtypes = [ctypes.c_void_p, ctypes.c_int,
 dll.atlas_get_tensor_index.restype = ctypes.c_int
 dll.atlas_get_tensor_index.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
 
+dll.atlas_get_tokenizer.restype = ctypes.POINTER(ctypes.c_uint8)
+dll.atlas_get_tokenizer.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
+
 dll.atlas_rmsnorm_f32.restype = None
 dll.atlas_rmsnorm_f32.argtypes = [ctypes.POINTER(ctypes.c_float),
     ctypes.POINTER(ctypes.c_uint8), ctypes.POINTER(ctypes.c_float),
@@ -202,6 +205,30 @@ class AtlasModel:
         if idx_lm_head >= 0:
             dll.atlas_quantize_lmhead(self.model_ptr, idx_lm_head)
         print(f"[Atlas] lm_head quantized ({time.time()-t0:.1f}s)")
+
+        # Load embedded tokenizer (v5+), fallback to model_dir for v4
+        # Block format: [tokenizer_json_size:4][tokenizer.json bytes][config_size:4][config.json bytes]
+        self._tok = None
+        self._chat_template = None
+        tok_size = ctypes.c_int()
+        tok_ptr = dll.atlas_get_tokenizer(self.model_ptr, tok_size)
+        if tok_ptr and tok_size.value > 0:
+            import struct
+            raw = ctypes.string_at(tok_ptr, tok_size.value)
+            try:
+                pos = 0
+                js_size = struct.unpack_from('<I', raw, pos)[0]; pos += 4
+                tok_json = raw[pos:pos+js_size]; pos += js_size
+                cfg_size = struct.unpack_from('<I', raw, pos)[0]; pos += 4
+                if cfg_size > 0:
+                    import json
+                    cfg = json.loads(raw[pos:pos+cfg_size].decode('utf-8'))
+                    self._chat_template = cfg.get('chat_template')
+                from tokenizers import Tokenizer
+                self._tok = Tokenizer.from_buffer(tok_json)
+                print("[Atlas] Loaded embedded tokenizer")
+            except Exception as e:
+                print(f"[Atlas] Tokenizer load failed: {e}")
 
 
     def _cache_indices(self):
@@ -498,14 +525,21 @@ class AtlasModel:
     def generate(self, prompt, max_new_tokens=50, temperature=1.0,
                  top_k=40, top_p=0.9):
         try:
-            model_dir = getattr(self, '_model_dir', None)
-            if not model_dir:
-                model_dir = os.path.dirname(self._safe_path) if self._safe_path else '.'
-            tok = AutoTokenizer.from_pretrained(
-                model_dir,
-                local_files_only=True)
-        except:
-            return "[TOKENIZER ERROR]"
+            if self._tok is not None:
+                from transformers import PreTrainedTokenizerFast
+                tok = PreTrainedTokenizerFast(
+                    tokenizer_object=self._tok,
+                    chat_template=self._chat_template)
+                tok.add_special_tokens({"pad_token": "<|pad|>"})
+            else:
+                model_dir = getattr(self, '_model_dir', None)
+                if not model_dir:
+                    model_dir = os.path.dirname(self._safe_path) if self._safe_path else '.'
+                tok = AutoTokenizer.from_pretrained(
+                    model_dir,
+                    local_files_only=True)
+        except Exception as e:
+            return f"[TOKENIZER ERROR: {e}]"
 
         eos_id = tok.eos_token_id
         stop_tokens = ['<|user|>', '<|system|>', '<|end|>']
