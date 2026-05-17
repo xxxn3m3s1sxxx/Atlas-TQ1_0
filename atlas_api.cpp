@@ -13,11 +13,22 @@
   #include <io.h>
   #include <windows.h>
   // VirtualAlloc returns memory to OS on free — no fragmentation
+  struct AllocHdr { void* base; size_t total; };
   static uint8_t* atlas_valloc(size_t size) {
-      return (uint8_t*)VirtualAlloc(NULL, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+      size_t hdr = sizeof(AllocHdr), align = 32;
+      size_t total = hdr + size + (align - 1);
+      uint8_t* base = (uint8_t*)VirtualAlloc(NULL, total,
+          MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+      if (!base) return nullptr;
+      uint8_t* data = (uint8_t*)(((uintptr_t)(base + hdr + align - 1)) & ~(align - 1));
+      AllocHdr* h = (AllocHdr*)(data - hdr);
+      h->base = base; h->total = total;
+      return data;
   }
   static void atlas_vfree(uint8_t* ptr) {
-      if (ptr) VirtualFree(ptr, 0, MEM_RELEASE);
+      if (!ptr) return;
+      AllocHdr* h = (AllocHdr*)(ptr - sizeof(AllocHdr));
+      VirtualFree(h->base, 0, MEM_RELEASE);
   }
   #define FSEEK _fseeki64
   #define FTELL _ftelli64
@@ -30,15 +41,24 @@
   #include <sys/stat.h>
   #include <fcntl.h>
   // mmap-based allocator — MAP_POPULATE hints pages into RAM
+  struct AllocHdr { void* base; size_t total; };
   static uint8_t* atlas_valloc(size_t size) {
-      size_t pages = (size + 4095) & ~4095;
+      size_t hdr = sizeof(AllocHdr), align = 32;
+      size_t total = hdr + size + (align - 1);
+      size_t pages = (total + 4095) & ~4095;
       void* p = mmap(NULL, pages, PROT_READ | PROT_WRITE,
                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
       if (p == MAP_FAILED) return nullptr;
-      return (uint8_t*)p;
+      uint8_t* base = (uint8_t*)p;
+      uint8_t* data = (uint8_t*)(((uintptr_t)(base + hdr + align - 1)) & ~(align - 1));
+      AllocHdr* h = (AllocHdr*)(data - hdr);
+      h->base = base; h->total = pages;
+      return data;
   }
   static void atlas_vfree(uint8_t* ptr) {
-      if (ptr) munmap(ptr, 0);  // size=0 is valid: kernel uses vma size
+      if (!ptr) return;
+      AllocHdr* h = (AllocHdr*)(ptr - sizeof(AllocHdr));
+      munmap(h->base, h->total);
   }
   #define FSEEK fseeko
   #define FTELL ftello
@@ -110,12 +130,14 @@ struct AtlasModel {
     int max_batch = 0;
     // mmap cache handles (for int8 data loaded from .i8 file)
     void* mmap_base = nullptr;      // MapViewOfFile base (.i8 cache)
-    void* mmap_handle = nullptr;    // CreateFileMapping handle
-    void* mmap_file = nullptr;      // CreateFile handle
+    void* mmap_handle = nullptr;    // CreateFileMapping handle (Win) / file size (Lin)
+    void* mmap_file = nullptr;      // CreateFile handle (Win) / fd (Lin)
+    size_t mmap_size = 0;           // actual file size for range checks
     // mmap atlas file handles (for fp16 tensor data — demand-paged by OS)
     void* atlas_mmap_base = nullptr;
-    void* atlas_mmap_handle = nullptr;
-    void* atlas_mmap_file = nullptr;
+    void* atlas_mmap_handle = nullptr;  // CreateFileMapping handle (Win) / file size (Lin)
+    void* atlas_mmap_file = nullptr;    // duplicated fd (Win: HANDLE, Lin: fd)
+    size_t atlas_mmap_size = 0;        // actual file size for range checks
     // Int8 quantized lm_head (per-row symmetric, ~403 MB instead of 1.5 GB fp32)
     int8_t* lm_head_i8 = nullptr;
     int32_t* lm_head_offsets = nullptr;  // precomputed 128 * sum(w) per row
@@ -134,27 +156,13 @@ struct AtlasModel {
     }
 
     bool is_mapped(const uint8_t* ptr) const {
-        // Check .i8 cache mmap
-        if (mmap_base) {
-            int64_t mmap_sz;
-#ifdef _WIN32
-            mmap_sz = 0xFFFFFFFF;
-#else
-            mmap_sz = (int64_t)(intptr_t)mmap_handle;
-#endif
+        if (mmap_base && mmap_size > 0) {
             if (ptr >= (const uint8_t*)mmap_base &&
-                ptr < (const uint8_t*)mmap_base + mmap_sz) return true;
+                ptr < (const uint8_t*)mmap_base + mmap_size) return true;
         }
-        // Check atlas file mmap
-        if (atlas_mmap_base) {
-            int64_t sz;
-#ifdef _WIN32
-            sz = 0xFFFFFFFF;
-#else
-            sz = (int64_t)(intptr_t)atlas_mmap_handle;
-#endif
+        if (atlas_mmap_base && atlas_mmap_size > 0) {
             return ptr >= (const uint8_t*)atlas_mmap_base &&
-                   ptr < (const uint8_t*)atlas_mmap_base + sz;
+                   ptr < (const uint8_t*)atlas_mmap_base + atlas_mmap_size;
         }
         return false;
     }
@@ -263,6 +271,7 @@ ATLAS_API AtlasModel* atlas_load(const char* path) {
             m->atlas_mmap_base = map_base;
             m->atlas_mmap_handle = hMapW;
             m->atlas_mmap_file = (void*)hDup;
+            m->atlas_mmap_size = (size_t)file_size;
         } else {
             CloseHandle(hMapW); CloseHandle(hDup);
         }
@@ -279,6 +288,7 @@ ATLAS_API AtlasModel* atlas_load(const char* path) {
             m->atlas_mmap_base = map_base;
             m->atlas_mmap_handle = (void*)(intptr_t)file_size;
             m->atlas_mmap_file = (void*)(intptr_t)map_fd;
+            m->atlas_mmap_size = (size_t)file_size;
         } else {
             close(map_fd);
         }
@@ -342,7 +352,7 @@ ATLAS_API void atlas_free(AtlasModel* m) {
         CloseHandle(m->mmap_handle);
         CloseHandle((HANDLE)m->mmap_file);
 #else
-        munmap(m->mmap_base, 0);
+        munmap(m->mmap_base, m->mmap_size);
         close((int)(intptr_t)m->mmap_file);
 #endif
     }
@@ -353,8 +363,8 @@ ATLAS_API void atlas_free(AtlasModel* m) {
         CloseHandle(m->atlas_mmap_handle);
         CloseHandle((HANDLE)m->atlas_mmap_file);
 #else
-        munmap(m->atlas_mmap_base, 0);
-        // Don't close fd — atlas_load doesn't dup on Linux (already closed via fclose)
+        munmap(m->atlas_mmap_base, m->atlas_mmap_size);
+        close((int)(intptr_t)m->atlas_mmap_file);
 #endif
     }
     delete m;
@@ -605,7 +615,7 @@ ATLAS_API int atlas_load_cache(AtlasModel* m, const char* atlas_path) {
 
         auto& t = m->tensors[i];
         if (t.ttype == 0 && cttype == 3 && ds > 0 && off >= 0) {
-            if (t.data) atlas_vfree(t.data);
+            if (t.data && !m->is_mapped(t.data)) atlas_vfree(t.data);
             t.ttype = 3;
             t.row_dim = row_dim;
             t.packed_cols = cpc;
@@ -615,10 +625,11 @@ ATLAS_API int atlas_load_cache(AtlasModel* m, const char* atlas_path) {
         }
     }
 
-    // Store mmap handles for cleanup in atlas_free
+    // Store mmap handles + size for cleanup in atlas_free
     m->mmap_base = base;
     m->mmap_handle = hMap;
     m->mmap_file = hFile;
+    m->mmap_size = file_size;
 
     printf("[CACHE] Loaded %d/%d tensors\n", replaced, n);
     return replaced > 0 ? 1 : 0;
@@ -659,7 +670,7 @@ ATLAS_API void atlas_decompress_all(AtlasModel* m) {
         }
 
         // Free packed data, replace with int8
-        atlas_vfree(t.data);
+        if (t.data && !m->is_mapped(t.data)) atlas_vfree(t.data);
         t.data = new_data;
         t.data_size = 2 + n_vals + t.row_dim * 4;
         t.ttype = 3;  // int8-decoded

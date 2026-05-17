@@ -26,6 +26,12 @@
   Mit korrigiertem Reference: **corr=0.9967**, max_diff=4.0 (durch shared quantization). Engine korrekt.
 - **`atlas_set_use_f32_matmul` API**, Bug 8.6 Disk Space Check, Short-Write Retry, File Size Validation, `hsum_ps` helper.
 - **All 4 models coherence verified** with default sampling.
+- **v1.0.9 Memory Audit**: Vier Bugs im mmap/Cleanup-Code gefixt:
+  1. **Bug A — atlas_vfree silent no-op**: `munmap(ptr, 0)` auf Linux leakt Speicher (kernel gibt -EINVAL für len=0). Fix: Allocation-Header in `atlas_valloc` (speichert base+size 16 Bytes vor aligned Data Pointer). `atlas_vfree` liest Header aus → `munmap(h->base, h->total)` bzw. `VirtualFree(h->base, 0, MEM_RELEASE)`.
+  2. **Bug B — atlas_vfree auf mmap-Pointer**: `atlas_decompress_all` und `atlas_load_cache` riefen `atlas_vfree(t.data)` auf Pointern in die atlas-mmap. Fix: `is_mapped`-Check vor jedem `atlas_vfree`.
+  3. **Bug C — is_mapped fake Size**: Windows nutzte `0xFFFFFFFF` als mmap-Range. Fix: `mmap_size`/`atlas_mmap_size` Felder in `AtlasModel`, gesetzt beim Laden, genutzt in `is_mapped`.
+  4. **Bug D — Linux fd leak**: `dup(fd)` in `atlas_load` wurde nie geschlossen. Fix: `close((int)(intptr_t)m->atlas_mmap_file)` in `atlas_free`.
+- **Speicherbereinigung**: Alle 9 Platform-Fixes konsolidiert, `atlas.dll` rebuild.
 
 ### In Progress
 - **(none)**
