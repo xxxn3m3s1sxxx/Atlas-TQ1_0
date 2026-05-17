@@ -13,7 +13,7 @@
 //   [17:4]  uint32 vocab_size (int32)
 //   [21:8]  float64 rope_theta (version>=3), else 10000.0
 //   [29:4]  int32  tokenizer_size (v5+), 0 if no embedded tokenizer
-//   [33:4]  int32  tokenizer_offset (v5+), absolute file offset
+//   [33:4]  uint32 tokenizer_offset (v5+), absolute file offset
 //   [56:4]  int32  name_block_size (v4+)
 //   [60:4]  int32  n_tensors
 //   [64:]   tensor directory: n × [ttype:1][file_offset:4][row_dim:4][packed_cols:3]

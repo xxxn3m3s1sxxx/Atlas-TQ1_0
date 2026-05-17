@@ -238,7 +238,7 @@ struct AtlasModel {
     size_t atlas_mmap_size = 0;        // actual file size for range checks
     // Embedded tokenizer data (v5+)
     int tokenizer_size = 0;
-    int tokenizer_offset = 0;
+    uint32_t tokenizer_offset = 0;
     // Int8 quantized lm_head (per-row symmetric, ~403 MB instead of 1.5 GB fp32)
     int8_t* lm_head_i8 = nullptr;
     int32_t* lm_head_offsets = nullptr;  // precomputed 128 * sum(w) per row
@@ -318,7 +318,7 @@ ATLAS_API AtlasModel* atlas_load(const char* path) {
 
     // v5+ tokenizer header fields
     memcpy(&tmp32, hdr+29, 4); m->tokenizer_size = (int)tmp32;
-    memcpy(&tmp32, hdr+33, 4); m->tokenizer_offset = (int)tmp32;
+    uint32_t tok_off_u32; memcpy(&tok_off_u32, hdr+33, 4); m->tokenizer_offset = tok_off_u32;
 
     printf("[ATLAS] v%d model: %dL %dH %dI %d/%d heads %d vocab %.0f theta | %d tensors %s\n",
            version,
@@ -536,7 +536,7 @@ ATLAS_API const uint8_t* atlas_get_tokenizer(AtlasModel* m, int* size) {
         if (size) *size = 0; return nullptr;
     }
     if (size) *size = m->tokenizer_size;
-    return (const uint8_t*)m->atlas_mmap_base + m->tokenizer_offset;
+    return (const uint8_t*)m->atlas_mmap_base + (ptrdiff_t)m->tokenizer_offset;
 }
 
 ATLAS_API int atlas_get_tensor_index(AtlasModel* m, const char* name) {
