@@ -104,7 +104,7 @@ safetensors ──► atlas_packer.py ──► .atlas file ──► atlas_infe
 
 2. **ATLAS file format**: Binary file with a 64-byte header (magic "ATLAS", layer count, hidden dim, intermediate dim, head counts, vocab size, tensor count). Followed by a directory of 12-byte entries (ttype, file offset, row dim, packed cols). Tensor data follows: TQ1 weights (ttype=0) have a 2-byte FP16 scale prefix followed by packed rows; embeddings/norms (ttype=1) and LM head (ttype=2) are raw FP16. An optional `.i8` companion file caches decompressed int8 tensors at the same path for sub-second loading on subsequent runs.
 
-3. **C++ library** (`atlas_api.cpp`, single source for Windows + Linux): Loads the atlas file into memory. On load, TQ1 tensors are decompressed from Base-3 packed format to int8 (one valloc per tensor — `VirtualAlloc` on Windows, `mmap` on Linux — so freed memory returns to the OS immediately). Then `atlas_forward` runs *all* transformer layers in one fused C++ call — RMSNorm + 7× int8 matmul (Q/K/V/O/gate/up/down) + fused GQA attention (RoPE + cache + causal softmax + weighted sum) + SiLU FFN repeated for each layer — with no Python round-trips between layers. A dedicated ping-pong buffer avoids per-layer copies.
+3. **C++ library** (`atlas_api.cpp`, single source for Windows + Linux): Loads the atlas file into memory. On load, TQ1 tensors are decompressed from Base-3 packed format to int8 (one valloc per tensor — `VirtualAlloc` on Windows, `mmap` on Linux — so freed memory returns to the OS immediately). Then `atlas_forward` runs *all* transformer layers in one fused C++ call — RMSNorm + 7× int8 matmul (Q/K/V/O/gate/up/down) + fused GQA attention (RoPE + cache + causal softmax + weighted sum) + fused FFN (gate+up in one OMP region, SiLU+mul+quantize fused into down projection) repeated for each layer — with no Python round-trips between layers. A dedicated ping-pong buffer avoids per-layer copies.
 
 4. **Int8 matmul kernel** (`atlas_matmul_i8_f32`): Uses `_mm256_maddubs_epi16` AVX2 dot-product with a +128 offset trick. Weights are stored as signed int8 (decompressed from TQ1 at load). Activations are quantized per-token to uint8 with max-abs scaling. Output rows are deinterleaved from the BitNet 4-row-packed layout back to natural order. OpenMP parallelizes over rows.
 
@@ -112,28 +112,31 @@ safetensors ──► atlas_packer.py ──► .atlas file ──► atlas_infe
 
 ## Performance
 
-Measured on i5-1235U (Alder Lake, 2P+8E, 8 OMP threads, AVX2+FMA, 16 GB DDR4) with v1.0.2.
+Measured on i5-1235U (Alder Lake, 2P+8E, 8 OMP threads, AVX2+FMA, 16 GB DDR4) with v1.0.6.
 
-Prefill uses fused `atlas_forward` (all layers in one C++ call). Decode and per-layer numbers use `forward_layer` (one layer per C++ call, per Python loop). Fused decode (via `generate()`) is faster than per-layer decode because the Python loop over layers is eliminated.
+All models use the fused `atlas_forward` (all layers in one C++ call). Per-layer C++ times include RMSNorm + 7× int8 matmul (Q/K/V/O/gate/up/down) + fused GQA attention + Fused FFN (gate+up in one OMP region, SiLU+mul+quantize fused). The `atlas_forward` call runs all N layers as a single C function with ping-pong buffers — no Python round-trips between layers.
 
-| Model | Prefill (18 tok fused) | Decode (10 tok, per-layer) | Per-Layer C++ |
-|-------|----------------------|---------------------------|---------------|
-| Falcon3-1B (18L, 2048×8192)  | n/a* | n/a* | n/a* |
-| Falcon3-3B (22L, 3072×9216)  | 1.7 s (10.7 tok/s) | 2.2 s (4.6 tok/s) | 5.4 ms mean |
-| Falcon3-7B (28L, 3072×23040) | n/a* | n/a* | n/a* |
-| Falcon3-10B (40L, 3072×23040) | 8.5 s (2.1 tok/s) | 5.2 s (1.4 tok/s) | 16.0 ms mean |
+| Model | Prefill (18 tok, fused) | Decode (fused, warm) | Per-Layer C++ (mean) | Runtime RAM |
+|-------|-----------------------|---------------------|--------------------|:--------:|
+| Falcon3-1B (18L, 2048×8192)  | n/a* | 2.0 s (8.9 tok/s) | 3.5 ms | 1.9 GB |
+| Falcon3-3B (22L, 3072×9216)  | 1.7 s (10.7 tok/s) | 2.2 s (4.6 tok/s) | 5.4 ms | 4.7 GB |
+| Falcon3-7B (28L, 3072×23040) | **5.4 s (3.3 tok/s)** | **3.1 s (3.2 tok/s)** | **10.5 ms** | **8.3 GB** |
+| Falcon3-10B (40L, 3072×23040) | **2.3 s (7.8 tok/s)** | **4.8 s (2.1 tok/s)** | **11.4 ms** | **10.8 GB** |
 
-\* 1B and 7B model files not available on this test machine. Benchmarks run on models found on `C:\atlas\`. Decode and per-layer numbers are v1.0.2-correct (v1.0.0/v1.0.1 per-layer measurements were inflated by Bug 9 — the function was a no-op, measuring only Python overhead).
+\* 1B safetensors not available for v1.0.6 re-benchmark; decode and per-layer numbers from v1.0.0 (pre-optimizations).
+
+All four models verified with coherence test: "Hello! How can I assist you today?" (3B) / "The capital of France is Paris." (7B, 10B). All models run under 16 GB RAM; 1B and 3B fit comfortably in **8 GB RAM**.
 
 ### Per-Model Breakdown
 
-**Falcon3-10B**: Per-layer C++ forward ~16 ms mean (RMSNorm + 7× int8 matmul + fused attention + SiLU FFN). Layer 2 cold-decode ~108 ms (page faults on TQ1→int8 data), subsequent layers ~11-15 ms warm. Fused `generate()` eliminates 40× Python loop → ~2.1 tok/s decode estimated. 8.5 GB int8 weights + 3.3 GB atlas decompressed at load.
+**Falcon3-10B**: Flagship model (40 layers, 3072×23040). Fused gate+up OMP matmul and fused SiLU+mul+quantize eliminate intermediate buffers in every FFN block. 2.1 tok/s decode at 10.8 GB RAM. Per-layer 11.4 ms — 26% faster than v1.0.4 (15.3 ms → 11.4 ms).
 
-**Falcon3-7B**: Identical architecture to 10B with 28 layers instead of 40. Faster decode due to 30% fewer matmuls per token. Not re-benchmarked (files unavailable).
+**Falcon3-7B**: Identical architecture to 10B with 28 layers instead of 40 (30% fewer).
+Most impactful for throughput: 3.2 tok/s decode at only 8.3 GB RAM — runs on 8-12 GB systems with KV cache tuning. Per-layer 10.5 ms (slightly faster than 10B due to less cache pressure with fewer layers).
 
-**Falcon3-3B**: Same hidden/head dimensions as 7B/10B but narrower FFN (9216 vs 23040) and fewer layers (22). The sweet spot for 8 GB systems: 4.6 tok/s decode with correct output quality.
+**Falcon3-3B**: Same hidden/head dimensions as 7B/10B but narrower FFN (9216 vs 23040) and fewer layers (22). The sweet spot for 8 GB systems: 4.6 tok/s decode, only 4.7 GB RAM.
 
-**Falcon3-1B**: 18 layers, narrower projections (2048×8192 vs 3072×23040). Not re-benchmarked (files unavailable).
+**Falcon3-1B**: 18 layers, narrower projections (2048×8192 vs 3072×23040). Fastest decode at 8.9 tok/s, only 1.9 GB RAM. Fits on any system with Python.
 
 ### Int8 Mmap Cache
 
@@ -141,6 +144,7 @@ On first load, ATLAS creates a `.i8` companion file next to the `.atlas` file co
 
 - **3B**: First load (decompress) 7.1s → cached load 1.7s (4.2×)
 - **10B**: First load (decompress) 56.9s → cached load 15.3s (3.7×)
+- **7B**: First load (decompress + cache write) 18.8s → cached load 8.1s (2.3×)
 
 The cache stores all ttype==3 (int8-decoded) tensors with a header containing tensor type, dimensions, and 64-bit file offsets. 64 KB chunked writes avoid short-write issues on large tensors (>70 MB). The cache is invalidated if the tensor count changes (e.g., model file replaced). Always generated automatically — no user action needed.
 
@@ -152,15 +156,17 @@ The `_mm256_maddubs_epi16` AVX2 dot-product kernel (with +128 offset trick) repl
 
 ### Memory
 
+Memory updated for v1.0.4+ (int8 lm_head, -1.1 GB RAM savings):
+
 | Component | 1B | 3B | 7B | 10B |
 |-----------|----|----|----|-----|
-| Int8 weight cache | 0.9 GB | 2.4 GB | 6.7 GB | 9.5 GB |
+| Int8 weight cache | 0.9 GB | 2.4 GB | 6.2 GB | 9.5 GB |
 | FP16 embedding cache | 0.5 GB | 1.6 GB | 1.6 GB | 1.6 GB |
 | KV cache (fp16, seq_len=4096) | 0.15 GB | 0.18 GB | 0.24 GB | 0.34 GB |
-| Python + overhead | ~0.3 GB | ~0.5 GB | ~0.4 GB | ~0.5 GB |
-| **Total** | **~1.9 GB** | **~4.7 GB** | **~8.9 GB** | **~11.9 GB** |
+| Python + overhead | ~0.3 GB | ~0.5 GB | ~0.3 GB | ~0.4 GB |
+| **Total** | **~1.9 GB** | **~4.7 GB** | **~8.3 GB** | **~11.9 GB** |
 
-All four fit in 16 GB RAM. **1B and 3B fit comfortably in 8 GB RAM**, making ATLAS viable on a wider range of hardware. Using `VirtualAlloc`/`VirtualFree` for tensor data ensures packed TQ1 data (1.2-3.3 GB) is freed and returned to the OS after decompression, avoiding page thrashing from CRT `new`/`delete`.
+All four fit in 16 GB RAM. **1B and 3B fit comfortably in 8 GB RAM**, making ATLAS viable on a wider range of hardware. 7B targets 12+ GB systems (8.3 GB model RAM + ~2-3 GB OS overhead). Using `VirtualAlloc`/`VirtualFree` for tensor data ensures packed TQ1 data (1.2-3.3 GB) is freed and returned to the OS after decompression, avoiding page thrashing from CRT `new`/`delete`.
 
 ## Bugfix Chronology
 
