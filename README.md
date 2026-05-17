@@ -14,10 +14,10 @@ BitNet b1.58 models replace full-precision weights with ternary values (-1, 0, +
 
 | Model | File | Atlas Size | Layers | Hidden | Intermediate | Heads | KV Heads |
 |-------|------|-----------|--------|--------|-------------|-------|----------|
-| Falcon3-1B-Instruct-1.58bit | `falcon3-1b-tq1.atlas` | 1.21 GB | 18 | 2048 | 8192 | 8 | 4 |
-| Falcon3-3B-Instruct-1.58bit | `falcon3-3b-tq1.atlas` | 1.95 GB | 22 | 3072 | 9216 | 12 | 4 |
-| Falcon3-7B-Instruct-1.58bit | `falcon3-7b-tq1.atlas` | 2.74 GB | 28 | 3072 | 23040 | 12 | 4 |
-| Falcon3-10B-Instruct-1.58bit | `falcon3-10b-tq1.atlas` | 3.27 GB | 40 | 3072 | 23040 | 12 | 4 |
+| Falcon3-1B-Instruct-1.58bit | `falcon3-1b-tq1.atlas` | 1.22 GB | 18 | 2048 | 8192 | 8 | 4 |
+| Falcon3-3B-Instruct-1.58bit | `falcon3-3b-tq1.atlas` | 1.96 GB | 22 | 3072 | 9216 | 12 | 4 |
+| Falcon3-7B-Instruct-1.58bit | `falcon3-7b-tq1.atlas` | 2.75 GB | 28 | 3072 | 23040 | 12 | 4 |
+| Falcon3-10B-Instruct-1.58bit | `falcon3-10b-tq1.atlas` | 3.28 GB | 40 | 3072 | 23040 | 12 | 4 |
 
 All use `head_dim=256`, `rope_theta=1000042`, `vocab_size=131072`, GQA architecture. The `.atlas` extension identifies the file as loadable by the ATLAS engine. Atlas files use **v5 format**: a self-contained binary embedding tensor names, all weight data, and the full tokenizer (tokenizer.json + config). No external files are needed at inference time — `AtlasModel('file.atlas')` loads everything.
 
@@ -97,14 +97,14 @@ safetensors ──► atlas_packer.py ──► .atlas file ──► atlas_infe
                                           RMSNorm  Attention  FFN(SiLU)   ◄─ all in C++, per layer
                                          (C++)      (C++)     (7× int8)
                                                          │
-                                              Final RMSNorm + LM head (Python, numpy)
+                                               Final RMSNorm + LM head (C++ int8 GEMV)
 ```
 
 ### Pipeline stages
 
 1. **Packer** (`atlas_packer.py`): Reads HuggingFace safetensors with pre-quantized 2-bit packed weights (`byte = v0 + v1*4 + v2*16 + v3*64`). De-interleaves the BitNet row-aware format (4 weight rows per uint8 row). Repacks each row independently into TQ1.0: 5 ternary trits mapped to Base-3 values 0-242, padded with ternary-0 (mapped from value 1) to fill the last byte. FP16 per-tensor scales are stored as 2-byte prefixes.
 
-2. **ATLAS v5 file format**: Binary file with a 64-byte header (magic "ATLASv4", version=5, model hyperparameters, tokenizer offset/size at bytes 29-36, name block size at bytes 56-59, tensor count at bytes 60-63). Directory of 12-byte entries follows (ttype, file offset, row dim, packed cols). After the directory, a variable-length name block stores null-terminated tensor names. Then tensor data follows: TQ1 weights (ttype=0) have a 2-byte FP16 scale prefix followed by packed rows; embeddings/norms (ttype=1) and LM head (ttype=2) are raw FP16. At the end of the file, the tokenizer block stores the raw `tokenizer.json` and `tokenizer_config.json` (size-prefixed, no merge) — loadable by `tokenizers::Tokenizer::from_buffer()`. C API `atlas_get_tokenizer()` exposes the raw bytes. An `.i8` companion file caches decompressed int8 tensors at the same path for sub-second loading on subsequent runs. No external model directory is needed: `AtlasModel('model.atlas')` is sufficient.
+2. **ATLAS v5 file format**: Binary file with a 64-byte header (magic `"ATLAS"`, version=5 at bytes 5-6, model hyperparameters, tokenizer offset/size at bytes 29-36, name block size at bytes 56-59, tensor count at bytes 60-63). Directory of 12-byte entries follows (ttype, file offset, row dim, packed cols). After the directory, a variable-length name block stores null-terminated tensor names. Then tensor data follows: TQ1 weights (ttype=0) have a 2-byte FP16 scale prefix followed by packed rows; embeddings/norms (ttype=1) and LM head (ttype=2) are raw FP16. At the end of the file, the tokenizer block stores the raw `tokenizer.json` and `tokenizer_config.json` (size-prefixed, no merge) — loadable by `tokenizers::Tokenizer::from_buffer()`. C API `atlas_get_tokenizer()` exposes the raw bytes. An `.i8` companion file caches decompressed int8 tensors at the same path for sub-second loading on subsequent runs. No external model directory is needed: `AtlasModel('model.atlas')` is sufficient.
 
 3. **C++ library** (`atlas_api.cpp`, single source for Windows + Linux): Loads the atlas file into memory. On load, TQ1 tensors are decompressed from Base-3 packed format to int8 (one valloc per tensor — `VirtualAlloc` on Windows, `mmap` on Linux — so freed memory returns to the OS immediately). Then `atlas_forward` runs *all* transformer layers in one fused C++ call — RMSNorm + 7× int8 matmul (Q/K/V/O/gate/up/down) + fused GQA attention (RoPE + cache + causal softmax + weighted sum) + fused FFN (gate+up in one OMP region, SiLU+mul+quantize fused into down projection) repeated for each layer — with no Python round-trips between layers. A dedicated ping-pong buffer avoids per-layer copies. A f32 matmul bypass (`atlas_set_use_f32_matmul`) can skip activation quantization for small models (auto-enabled for hidden ≤ 2048), using direct AVX2 f32×i8 FMA as a numerical reference path.
 
@@ -134,9 +134,9 @@ All models verified with coherence test: "The capital of France is Paris." (3B/7
 **Falcon3-7B**: Identical architecture to 10B with 28 layers instead of 40 (30% fewer).
 Most impactful for throughput: 3.2 tok/s decode at only 8.3 GB RAM — runs on 8-12 GB systems with KV cache tuning. Per-layer 10.5 ms (slightly faster than 10B due to less cache pressure with fewer layers).
 
-**Falcon3-3B**: Same hidden/head dimensions as 7B/10B but narrower FFN (9216 vs 23040) and fewer layers (22). The sweet spot for 8 GB systems: 4.6 tok/s decode, only 4.7 GB RAM.
+**Falcon3-3B**: Same hidden/head dimensions as 7B/10B but narrower FFN (9216 vs 23040) and fewer layers (22). The sweet spot for 8 GB systems: 5.0 tok/s decode, only 4.7 GB RAM.
 
-**Falcon3-1B**: 18 layers, narrower projections (2048×8192 vs 3072×23040). Fastest decode at 8.9 tok/s, only 1.9 GB RAM. Fits on any system with Python.
+**Falcon3-1B**: 18 layers, narrower projections (2048×8192 vs 3072×23040). Fastest decode at 9.4 tok/s, only 1.9 GB RAM. Fits on any system with Python.
 
 ### Int8 Mmap Cache
 
@@ -165,7 +165,7 @@ Memory updated for v1.0.4+ (int8 lm_head, -1.1 GB RAM savings):
 | Python + overhead | ~0.3 GB | ~0.5 GB | ~0.3 GB | ~0.4 GB |
 | **Total** | **~1.9 GB** | **~4.7 GB** | **~8.3 GB** | **~11.9 GB** |
 
-All four fit in 16 GB RAM. **1B and 3B fit comfortably in 8 GB RAM**, making ATLAS viable on a wider range of hardware. 7B targets 12+ GB systems (8.3 GB model RAM + ~2-3 GB OS overhead). Using `VirtualAlloc`/`VirtualFree` for tensor data ensures packed TQ1 data (1.2-3.3 GB) is freed and returned to the OS after decompression, avoiding page thrashing from CRT `new`/`delete`.
+All four fit in 16 GB RAM. **1B and 3B fit comfortably in 8 GB RAM**, making ATLAS viable on a wider range of hardware. 7B targets 12+ GB systems (8.3 GB model RAM + ~2-3 GB OS overhead). Using `VirtualAlloc`/`VirtualFree` (Windows) or `mmap`/`munmap` (Linux) for tensor data ensures packed TQ1 data (1.2-3.3 GB) is freed and returned to the OS after decompression, avoiding page thrashing from CRT `new`/`delete`.
 
 ## Bugfix Chronology
 
