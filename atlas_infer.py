@@ -345,7 +345,7 @@ class AtlasModel:
         max_abs = np.max(np.abs(act), axis=-1, keepdims=True)
         max_abs = np.maximum(max_abs, 1e-5)
         act_scale = 127.0 / max_abs
-        act_q = np.round(act * act_scale).astype(np.int8)
+        act_q = np.clip(np.round(act * act_scale), -127, 127).astype(np.int8)
 
         # Convert to uint8 with +128 offset (for maddubs unsigned operand)
         act_u8 = (act_q.astype(np.int32) + 128).clip(0, 255).astype(np.uint8)
