@@ -95,7 +95,10 @@ struct AtlasModel {
     int head_dim;
     int vocab_size;
     float rope_theta;
+    bool use_f32_matmul = false; // skip activation quantization (1B model needs full precision)
     std::vector<TensorInfo> tensors;
+    // Tensor names (loaded from v4+ atlas files, eliminates safetensors dependency)
+    std::vector<std::string> tensor_names;
 
     // Pre-allocated scratch buffers for forward_layer (lazy init)
     float* buf_gate = nullptr;      // [max_batch * inter_dim]
@@ -219,6 +222,26 @@ ATLAS_API AtlasModel* atlas_load(const char* path) {
         memcpy(&file_offsets[i], e+1, 4); m->tensors[i].file_offset = file_offsets[i];
         memcpy(&m->tensors[i].row_dim, e+5, 4);
         m->tensors[i].packed_cols = e[9] | (e[10]<<8) | (e[11]<<16);
+    }
+
+    // Load tensor names (v4+)
+    m->tensor_names.clear();
+    if (version >= 4) {
+        int nb_size; memcpy(&nb_size, hdr+56, 4);
+        if (nb_size > 0) {
+            // Names stored right after directory: [name_block_size:4] [name_0\0]... 
+            FSEEK(f, 64 + n_tensors * 12, SEEK_SET);
+            uint8_t* nb = new uint8_t[nb_size];
+            fread(nb, 1, nb_size, f);
+            int pos = 4;  // skip size field
+            for (int i = 0; i < n_tensors && pos < nb_size; i++) {
+                const char* s = (const char*)(nb + pos);
+                int len = (int)strnlen(s, nb_size - pos);
+                m->tensor_names.push_back(std::string(s, len));
+                pos += len + 1;
+            }
+            delete[] nb;
+        }
     }
 
     // Compute file size for last-tensor calculation
@@ -375,6 +398,30 @@ ATLAS_API void atlas_get_info(AtlasModel* m, int* n_layers, int* hidden_dim,
     if (vocab_size) *vocab_size = m->vocab_size;
 }
 
+// ─── Tensor name API (v4+, no safetensors dependency) ─────────────────
+ATLAS_API int atlas_get_tensor_count(AtlasModel* m) {
+    return m ? (int)m->tensor_names.size() : 0;
+}
+
+ATLAS_API int atlas_get_tensor_name(AtlasModel* m, int idx, char* buf, int buf_size) {
+    if (!m || idx < 0 || idx >= (int)m->tensor_names.size() || !buf || buf_size <= 0)
+        return 0;
+    const std::string& s = m->tensor_names[idx];
+    int len = (int)s.size();
+    int copy = len < buf_size - 1 ? len : buf_size - 1;
+    memcpy(buf, s.data(), copy);
+    buf[copy] = '\0';
+    return copy;
+}
+
+ATLAS_API int atlas_get_tensor_index(AtlasModel* m, const char* name) {
+    if (!m || !name) return -1;
+    for (int i = 0; i < (int)m->tensor_names.size(); i++) {
+        if (m->tensor_names[i] == name) return i;
+    }
+    return -1;
+}
+
 // ─── Cache file ──────────────────────────────────────────────────────
 // Save decompressed int8 tensors to a .i8 cache file for instant reload.
 // Format: [n_tensors:4] then per-tensor [ttype:1][row_dim:4][pc:4][ds:4][off:8]
@@ -398,10 +445,38 @@ static void cache_path(const char* atlas_path, char* out, int out_size) {
 
 ATLAS_API void atlas_save_cache(AtlasModel* m, const char* atlas_path) {
     char path[1024]; cache_path(atlas_path, path, sizeof(path));
-    FILE* f = fopen(path, "wb");
-    if (!f) { fprintf(stderr, "[CACHE] Cannot write %s\n", path); return; }
 
     int n = (int)m->tensors.size();
+    // Compute total data size needed
+    int64_t total_data = 0;
+    for (int i = 0; i < n; i++) {
+        auto& t = m->tensors[i];
+        if (t.ttype == 3 && t.data_size > 0 && t.data)
+            total_data += t.data_size;
+    }
+
+    int64_t header_size = 4 + (int64_t)n * 21;
+    int64_t cache_size = header_size + total_data;
+
+    // Check available disk space on Windows
+#ifdef _WIN32
+    char root[4] = { path[0], ':', '\\', 0 };
+    ULARGE_INTEGER free_bytes;
+    if (GetDiskFreeSpaceExA(root, &free_bytes, NULL, NULL)) {
+        if (cache_size > (int64_t)free_bytes.QuadPart) {
+            printf("[CACHE] Skip: need %.1f GB, only %.1f GB free on %s\n",
+                   cache_size / 1e9, (double)free_bytes.QuadPart / 1e9, root);
+            return;
+        }
+    }
+#endif
+
+    FILE* f = fopen(path, "wb");
+    if (!f) { fprintf(stderr, "[CACHE] Cannot write %s\n", path); return; }
+#ifdef _WIN32
+    setvbuf(f, NULL, _IONBF, 0);
+#endif
+
     fwrite(&n, 4, 1, f);
 
     // Only cache int8-decoded tensors (ttype==3). Non-int8 tensors (norms, embed, GQA scales)
@@ -430,25 +505,31 @@ ATLAS_API void atlas_save_cache(AtlasModel* m, const char* atlas_path) {
         fwrite(&off, 8, 1, f);
     }
 
-    // Write data in 64KB chunks to avoid fwrite buffer limits on single large writes
-    for (int i = 0; i < n; i++) {
+    // Write data, retrying on short writes
+    bool ok = true;
+    for (int i = 0; i < n && ok; i++) {
         if (offsets[i] < 0) continue;
         const uint8_t* ptr = m->tensors[i].data;
         int remaining = m->tensors[i].data_size;
         while (remaining > 0) {
-            int chunk = remaining > 65536 ? 65536 : remaining;
-            size_t written = fwrite(ptr, 1, chunk, f);
-            if ((int)written != chunk) {
-                fprintf(stderr, "[CACHE] WARNING: tensor %d chunk short write %zu/%d (remaining %d)\n",
-                        i, written, chunk, remaining);
-                break;
+            size_t written = fwrite(ptr, 1, remaining, f);
+            if ((int)written <= 0) {
+                fprintf(stderr, "[CACHE] ERROR: tensor %d write failed (%d remaining)\n", i, remaining);
+                ok = false; break;
             }
-            ptr += chunk;
-            remaining -= chunk;
+            ptr += written;
+            remaining -= (int)written;
         }
     }
+
     fclose(f);
-    printf("[CACHE] Saved %d tensors\n", n);
+
+    if (!ok) {
+        fprintf(stderr, "[CACHE] Write failed, deleting partial cache\n");
+        remove(path);
+    } else {
+        printf("[CACHE] Saved %d tensors (%.1f MB)\n", n, cache_size / 1e6);
+    }
 }
 
 ATLAS_API int atlas_load_cache(AtlasModel* m, const char* atlas_path) {
@@ -456,11 +537,17 @@ ATLAS_API int atlas_load_cache(AtlasModel* m, const char* atlas_path) {
     uint8_t* base = nullptr;
     void* hFile = nullptr;
     void* hMap = nullptr;
+    size_t file_size = 0;
 
 #ifdef _WIN32
     HANDLE hFileW = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hFileW == INVALID_HANDLE_VALUE) return 0;
+    LARGE_INTEGER fsize;
+    if (!GetFileSizeEx(hFileW, &fsize) || fsize.QuadPart < 4) {
+        CloseHandle(hFileW); return 0;
+    }
+    file_size = (size_t)fsize.QuadPart;
     HANDLE hMapW = CreateFileMappingA(hFileW, NULL, PAGE_READONLY, 0, 0, NULL);
     if (!hMapW) { CloseHandle(hFileW); return 0; }
     base = (uint8_t*)MapViewOfFile(hMapW, FILE_MAP_READ, 0, 0, 0);
@@ -471,7 +558,8 @@ ATLAS_API int atlas_load_cache(AtlasModel* m, const char* atlas_path) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) return 0;
     off_t fsize = lseek(fd, 0, SEEK_END);
-    if (fsize <= 0) { close(fd); return 0; }
+    if (fsize <= 4) { close(fd); return 0; }
+    file_size = (size_t)fsize;
     base = (uint8_t*)mmap(NULL, fsize, PROT_READ, MAP_PRIVATE, fd, 0);
     if (base == MAP_FAILED) { close(fd); return 0; }
     hFile = (void*)(intptr_t)fd;
@@ -479,7 +567,8 @@ ATLAS_API int atlas_load_cache(AtlasModel* m, const char* atlas_path) {
 #endif
 
     int n = *(int*)base;
-    if (n != (int)m->tensors.size()) {
+    int64_t min_size = 4 + (int64_t)n * 21;
+    if (n != (int)m->tensors.size() || file_size < (size_t)min_size) {
 #ifdef _WIN32
         UnmapViewOfFile(base); CloseHandle((HANDLE)hMap); CloseHandle((HANDLE)hFile);
 #else
@@ -489,7 +578,7 @@ ATLAS_API int atlas_load_cache(AtlasModel* m, const char* atlas_path) {
     }
 
     uint8_t* hdr = base + 4;
-    int64_t data_start = 4 + (int64_t)n * 21;
+    int64_t data_start = min_size;
 
     int replaced = 0;
     for (int i = 0; i < n; i++) {
@@ -499,6 +588,20 @@ ATLAS_API int atlas_load_cache(AtlasModel* m, const char* atlas_path) {
         int cpc; memcpy(&cpc, e+5, 4);
         int ds; memcpy(&ds, e+9, 4);
         int64_t off; memcpy(&off, e+13, 8);
+
+        // Validate offset + size fits within file
+        if (cttype == 3 && ds > 0 && off >= 0) {
+            if ((size_t)(data_start + off + ds) > file_size) {
+                // Truncated/partial cache — unsafe to use
+                printf("[CACHE] Truncated (tensor %d exceeds file), ignoring cache\n", i);
+#ifdef _WIN32
+                UnmapViewOfFile(base); CloseHandle((HANDLE)hMap); CloseHandle((HANDLE)hFile);
+#else
+                munmap(base, (size_t)(intptr_t)hMap); close((int)(intptr_t)hFile);
+#endif
+                return 0;
+            }
+        }
 
         auto& t = m->tensors[i];
         if (t.ttype == 0 && cttype == 3 && ds > 0 && off >= 0) {
@@ -930,6 +1033,61 @@ static void quantize_f32_to_u8(const float* act, int B, int D,
     }
 }
 
+// ─── Set f32 matmul mode (no activation quantization) ────────────────
+ATLAS_API void atlas_set_use_f32_matmul(AtlasModel* m, int val) {
+    if (m) m->use_f32_matmul = val ? true : false;
+}
+
+// ─── Helper: horizontal sum of __m256 float ──────────────────────────
+static inline float hsum_ps(__m256 v) {
+    __m128 l = _mm256_castps256_ps128(v);
+    __m128 h = _mm256_extractf128_ps(v, 1);
+    l = _mm_add_ps(l, h);
+    l = _mm_hadd_ps(l, l);
+    l = _mm_hadd_ps(l, l);
+    return _mm_cvtss_f32(l);
+}
+
+// ─── Helper: f32×i8 matmul + reorder (no activation quantization) ───
+// act_f32: [B, input_dim] float activations (not quantized)
+// weights: [rows, input_dim] int8 weights
+// scale: per-tensor dequant scale
+// output: [B, rows] reordered float output
+static void matmul_f32_reorder(int rows, int input_dim,
+    const int8_t* weights, const float* act_f32,
+    float scale, float* output, int B) {
+    int rows_packed = rows / 4;
+    #ifdef _OPENMP
+    #pragma omp parallel for if(rows_packed > 4)
+    #endif
+    for (int ur = 0; ur < rows_packed; ur++) {
+        for (int b = 0; b < B; b++) {
+            const float* a = act_f32 + b * input_dim;
+            float out4[4];
+            for (int sub = 0; sub < 4; sub++) {
+                const int8_t* w = weights + (ur * 4 + sub) * input_dim;
+                __m256 sum = _mm256_setzero_ps();
+                int c = 0;
+                for (; c + 8 <= input_dim; c += 8) {
+                    __m256 af = _mm256_loadu_ps(a + c);
+                    __m128i w8 = _mm_loadl_epi64((const __m128i*)(w + c));
+                    __m256i w32 = _mm256_cvtepi8_epi32(w8);
+                    __m256 wf = _mm256_cvtepi32_ps(w32);
+                    sum = _mm256_fmadd_ps(af, wf, sum);
+                }
+                float s = hsum_ps(sum);
+                for (; c < input_dim; c++) s += a[c] * w[c];
+                out4[sub] = s / scale;
+            }
+            float* dst = output + b * rows;
+            dst[0 * rows_packed + ur] = out4[0];
+            dst[1 * rows_packed + ur] = out4[1];
+            dst[2 * rows_packed + ur] = out4[2];
+            dst[3 * rows_packed + ur] = out4[3];
+        }
+    }
+}
+
 // ─── Helper: int8 matmul + reorder + dequant ──────────────────────────
 // act_u8: [B, input_dim] quantized activations
 // max_abs: [B] per-token max
@@ -1024,47 +1182,67 @@ static void forward_layer_internal(
     }
 
     float* max_abs = (float*)alloca(B * sizeof(float));
-    quantize_f32_to_u8(m->buf_act, B, max_qkv_dim, max_abs, m->buf_i8);
 
-    // Q projection: scratch=buf_act, output=buf_gate
-    {
-        int8_t* w; int32_t* rs; int rows, dim; float scale;
-        get_i8(tq, w, rs, rows, dim, scale);
-        matmul_reorder_deq(rows, dim, w, rs, m->buf_i8, max_abs,
-                          scale, m->buf_act, m->buf_gate, B);
-    }
     auto& tv = m->tensors[idx_v];
-    int i8_v_dim = tv.packed_cols * 5;
+    if (m->use_f32_matmul) {
+        // Full-precision path: f32×i8, no activation quantization
+        {
+            int8_t* w; int32_t* rs; int rows, dim; float scale;
+            get_i8(tq, w, rs, rows, dim, scale);
+            matmul_f32_reorder(rows, dim, w, m->buf_act, scale, m->buf_gate, B);
+        }
+        {
+            int8_t* w; int32_t* rs; int rows, dim; float scale;
+            get_i8(tk, w, rs, rows, dim, scale);
+            matmul_f32_reorder(rows, dim, w, m->buf_act, scale, m->buf_hidden, B);
+        }
+        {
+            int8_t* w; int32_t* rs; int rows, dim; float scale;
+            get_i8(tv, w, rs, rows, dim, scale);
+            matmul_f32_reorder(rows, dim, w, m->buf_act, scale, m->buf_up, B);
+        }
+    } else {
+        quantize_f32_to_u8(m->buf_act, B, max_qkv_dim, max_abs, m->buf_i8);
 
-    // K projection: scratch=buf_act (reused), output=buf_hidden
-    {
-        int8_t* w; int32_t* rs; int rows, dim; float scale;
-        get_i8(tk, w, rs, rows, dim, scale);
-        if (i8_k_dim != max_qkv_dim) {
-            for (int b = 0; b < B; b++) {
-                memcpy(m->buf_act + b * i8_k_dim, x_norm + b * H, H * sizeof(float));
-                memset(m->buf_act + b * i8_k_dim + H, 0,
-                       (i8_k_dim - H) * sizeof(float));
-            }
-            quantize_f32_to_u8(m->buf_act, B, i8_k_dim, max_abs, m->buf_i8);
+        // Q projection: scratch=buf_act, output=buf_gate
+        {
+            int8_t* w; int32_t* rs; int rows, dim; float scale;
+            get_i8(tq, w, rs, rows, dim, scale);
+            matmul_reorder_deq(rows, dim, w, rs, m->buf_i8, max_abs,
+                              scale, m->buf_act, m->buf_gate, B);
         }
-        matmul_reorder_deq(rows, dim, w, rs, m->buf_i8, max_abs,
-                          scale, m->buf_act, m->buf_hidden, B);
-    }
-    // V projection: scratch=buf_act (reused again, free after K over), output=buf_up
-    {
-        int8_t* w; int32_t* rs; int rows, dim; float scale;
-        get_i8(tv, w, rs, rows, dim, scale);
-        if (i8_v_dim != i8_k_dim) {
-            for (int b = 0; b < B; b++) {
-                memcpy(m->buf_act + b * i8_v_dim, x_norm + b * H, H * sizeof(float));
-                memset(m->buf_act + b * i8_v_dim + H, 0,
-                       (i8_v_dim - H) * sizeof(float));
+        int i8_v_dim = tv.packed_cols * 5;
+
+        // K projection: scratch=buf_act (reused), output=buf_hidden
+        {
+            int8_t* w; int32_t* rs; int rows, dim; float scale;
+            get_i8(tk, w, rs, rows, dim, scale);
+            if (i8_k_dim != max_qkv_dim) {
+                for (int b = 0; b < B; b++) {
+                    memcpy(m->buf_act + b * i8_k_dim, x_norm + b * H, H * sizeof(float));
+                    memset(m->buf_act + b * i8_k_dim + H, 0,
+                           (i8_k_dim - H) * sizeof(float));
+                }
+                quantize_f32_to_u8(m->buf_act, B, i8_k_dim, max_abs, m->buf_i8);
             }
-            quantize_f32_to_u8(m->buf_act, B, i8_v_dim, max_abs, m->buf_i8);
+            matmul_reorder_deq(rows, dim, w, rs, m->buf_i8, max_abs,
+                              scale, m->buf_act, m->buf_hidden, B);
         }
-        matmul_reorder_deq(rows, dim, w, rs, m->buf_i8, max_abs,
-                          scale, m->buf_act, m->buf_up, B);
+        // V projection: scratch=buf_act (reused again, free after K over), output=buf_up
+        {
+            int8_t* w; int32_t* rs; int rows, dim; float scale;
+            get_i8(tv, w, rs, rows, dim, scale);
+            if (i8_v_dim != i8_k_dim) {
+                for (int b = 0; b < B; b++) {
+                    memcpy(m->buf_act + b * i8_v_dim, x_norm + b * H, H * sizeof(float));
+                    memset(m->buf_act + b * i8_v_dim + H, 0,
+                           (i8_v_dim - H) * sizeof(float));
+                }
+                quantize_f32_to_u8(m->buf_act, B, i8_v_dim, max_abs, m->buf_i8);
+            }
+            matmul_reorder_deq(rows, dim, w, rs, m->buf_i8, max_abs,
+                              scale, m->buf_act, m->buf_up, B);
+        }
     }
 
     // ─── 3. Fused attention (reuse atlas_attention_f32) ───
@@ -1090,9 +1268,13 @@ static void forward_layer_internal(
             memcpy(m->buf_act + b * dim, attn_out + b * qd, qd * sizeof(float));
             memset(m->buf_act + b * dim + qd, 0, (dim - qd) * sizeof(float));
         }
-        quantize_f32_to_u8(m->buf_act, B, dim, max_abs, m->buf_i8);
-        matmul_reorder_deq(rows, dim, w, rs, m->buf_i8, max_abs,
-                          scale, m->buf_hidden, m->buf_gate, B);
+        if (m->use_f32_matmul) {
+            matmul_f32_reorder(rows, dim, w, m->buf_act, scale, m->buf_gate, B);
+        } else {
+            quantize_f32_to_u8(m->buf_act, B, dim, max_abs, m->buf_i8);
+            matmul_reorder_deq(rows, dim, w, rs, m->buf_i8, max_abs,
+                              scale, m->buf_hidden, m->buf_gate, B);
+        }
     }
 
     // ─── 5. Residual: output = input + attn_out_proj ───
@@ -1130,9 +1312,64 @@ static void forward_layer_internal(
         memcpy(m->buf_act + b * ffn_dim, x_norm2 + b * H, H * sizeof(float));
         memset(m->buf_act + b * ffn_dim + H, 0, (ffn_dim - H) * sizeof(float));
     }
-    quantize_f32_to_u8(m->buf_act, B, ffn_dim, max_abs, m->buf_i8);
 
-    {
+    if (m->use_f32_matmul) {
+        // Full-precision FFN: f32 activations × int8 weights, no quantization
+        int8_t* gw; int32_t* grs; int g_rows, g_dim_v; float g_scale;
+        int8_t* uw; int32_t* urs; int u_rows, u_dim_v; float u_scale;
+        get_i8(tg, gw, grs, g_rows, g_dim_v, g_scale);
+        get_i8(tu, uw, urs, u_rows, u_dim_v, u_scale);
+        int rows = g_rows, dim_w = g_dim_v;
+        int rows_packed = rows / 4;
+
+        #ifdef _OPENMP
+        #pragma omp parallel for if(rows_packed > 4)
+        #endif
+        for (int ur = 0; ur < rows_packed; ur++) {
+            const int8_t* gw4 = gw + ur * 4 * dim_w;
+            const int8_t* uw4 = uw + ur * 4 * dim_w;
+            for (int b = 0; b < B; b++) {
+                const float* a = m->buf_act + b * ffn_dim;
+                float g_val[4], u_val[4];
+                for (int sub = 0; sub < 4; sub++) {
+                    const int8_t* wg = gw4 + sub * dim_w;
+                    const int8_t* wu = uw4 + sub * dim_w;
+                    __m256 gs = _mm256_setzero_ps();
+                    __m256 us = _mm256_setzero_ps();
+                    int c = 0;
+                    for (; c + 8 <= dim_w; c += 8) {
+                        __m256 af = _mm256_loadu_ps(a + c);
+                        __m128i wg8 = _mm_loadl_epi64((const __m128i*)(wg + c));
+                        __m128i wu8 = _mm_loadl_epi64((const __m128i*)(wu + c));
+                        __m256 wg_f = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(wg8));
+                        __m256 wu_f = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(wu8));
+                        gs = _mm256_fmadd_ps(af, wg_f, gs);
+                        us = _mm256_fmadd_ps(af, wu_f, us);
+                    }
+                    float gs_f = hsum_ps(gs);
+                    float us_f = hsum_ps(us);
+                    for (; c < dim_w; c++) {
+                        gs_f += a[c] * wg[c];
+                        us_f += a[c] * wu[c];
+                    }
+                    g_val[sub] = gs_f / g_scale;
+                    u_val[sub] = us_f / u_scale;
+                }
+                float* g_out = m->buf_gate + b * rows;
+                float* u_out = m->buf_up + b * rows;
+                g_out[0 * rows_packed + ur] = g_val[0];
+                g_out[1 * rows_packed + ur] = g_val[1];
+                g_out[2 * rows_packed + ur] = g_val[2];
+                g_out[3 * rows_packed + ur] = g_val[3];
+                u_out[0 * rows_packed + ur] = u_val[0];
+                u_out[1 * rows_packed + ur] = u_val[1];
+                u_out[2 * rows_packed + ur] = u_val[2];
+                u_out[3 * rows_packed + ur] = u_val[3];
+            }
+        }
+    } else {
+        quantize_f32_to_u8(m->buf_act, B, ffn_dim, max_abs, m->buf_i8);
+
         int8_t* gw; int32_t* grs; int g_rows, g_dim_v; float g_scale;
         int8_t* uw; int32_t* urs; int u_rows, u_dim_v; float u_scale;
         get_i8(tg, gw, grs, g_rows, g_dim_v, g_scale);
@@ -1215,35 +1452,47 @@ static void forward_layer_internal(
         }
     }
 
-    // ─── 8. Fused SiLU(gate)*up + quantize → down matmul ───
-    // Fused: read gate+up once → SiLU+mul → pad → quantize → buf_i8.
-    // Eliminates: separate silu_inplace (buffered write), mul→buf_hidden, memcpy→buf_act.
+    // ─── 8. Fused SiLU(gate)*up → down matmul ───
     {
         auto& td = m->tensors[idx_down];
         int8_t* w; int32_t* rs; int rows, dim; float scale;
         get_i8(td, w, rs, rows, dim, scale);
-        for (int b = 0; b < B; b++) {
-            const float* g = m->buf_gate + b * inter;
-            const float* u = m->buf_up + b * inter;
-            float* tmp = m->buf_act + b * dim;
-            float mb = 1e-5f;
-            for (int i = 0; i < inter; i++) {
-                float v = (g[i] / (1.0f + expf(-g[i]))) * u[i];
-                tmp[i] = v;
-                float av = fabsf(v);
-                if (av > mb) mb = av;
+        if (m->use_f32_matmul) {
+            // Full-precision: compute SiLU(gate)*up directly into buf_act, then f32×i8 matmul
+            for (int b = 0; b < B; b++) {
+                const float* g = m->buf_gate + b * inter;
+                const float* u = m->buf_up + b * inter;
+                float* tmp = m->buf_act + b * dim;
+                for (int i = 0; i < inter; i++)
+                    tmp[i] = (g[i] / (1.0f + expf(-g[i]))) * u[i];
+                for (int i = inter; i < dim; i++) tmp[i] = 0.0f;
             }
-            for (int i = inter; i < dim; i++) tmp[i] = 0.0f;
-            float inv = 127.0f / mb;
-            max_abs[b] = mb;
-            for (int i = 0; i < dim; i++) {
-                int q = (int)(tmp[i] * inv + 128.5f);
-                if (q < 0) q = 0; if (q > 255) q = 255;
-                m->buf_i8[b * dim + i] = (uint8_t)q;
+            matmul_f32_reorder(rows, dim, w, m->buf_act, scale, m->buf_gate, B);
+        } else {
+            // Quantized path: SiLU(gate)*up → quantize to u8 → maddubs × i8 → dequant
+            for (int b = 0; b < B; b++) {
+                const float* g = m->buf_gate + b * inter;
+                const float* u = m->buf_up + b * inter;
+                float* tmp = m->buf_act + b * dim;
+                float mb = 1e-5f;
+                for (int i = 0; i < inter; i++) {
+                    float v = (g[i] / (1.0f + expf(-g[i]))) * u[i];
+                    tmp[i] = v;
+                    float av = fabsf(v);
+                    if (av > mb) mb = av;
+                }
+                for (int i = inter; i < dim; i++) tmp[i] = 0.0f;
+                float inv = 127.0f / mb;
+                max_abs[b] = mb;
+                for (int i = 0; i < dim; i++) {
+                    int q = (int)(tmp[i] * inv + 128.5f);
+                    if (q < 0) q = 0; if (q > 255) q = 255;
+                    m->buf_i8[b * dim + i] = (uint8_t)q;
+                }
             }
+            matmul_reorder_deq(rows, dim, w, rs, m->buf_i8, max_abs,
+                              scale, m->buf_hidden, m->buf_gate, B);
         }
-        matmul_reorder_deq(rows, dim, w, rs, m->buf_i8, max_abs,
-                          scale, m->buf_hidden, m->buf_gate, B);
     }
 
     // ─── 10. Residual: output += down_proj ───

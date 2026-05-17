@@ -81,7 +81,7 @@ def create_atlas_from_config(safetensors_path, output_path):
         n_tensors = len(names)
         header = bytearray(64)
         header[0:5] = b'ATLAS'
-        struct.pack_into('<H', header, 5, 3)  # v3: added rope_theta at offset 21
+        struct.pack_into('<H', header, 5, 4)  # v4: added tensor names
         struct.pack_into('<H', header, 7, n_layers)
         struct.pack_into('<H', header, 9, hidden)
         struct.pack_into('<H', header, 11, inter)
@@ -91,11 +91,22 @@ def create_atlas_from_config(safetensors_path, output_path):
         struct.pack_into('<I', header, 17, vocab)
         struct.pack_into('<d', header, 21, rope_theta)
         struct.pack_into('<I', header, 60, n_tensors)
+
+        # Build name block: [name_block_size:4] [name_0\0] [name_1\0] ...
+        name_bytes = b''.join(n.encode() + b'\0' for n in names)
+        name_block = struct.pack('<I', 4 + len(name_bytes)) + name_bytes
+        struct.pack_into('<I', header, 56, len(name_block))
+
         out.write(header)
 
-        data_start = 64 + len(names) * 12
+        data_start = 64 + len(names) * 12 + len(name_block)
         directory = bytearray(len(names) * 12)
         current_offset = data_start
+
+        # Write name block after directory
+        out.seek(64 + len(names) * 12)
+        out.write(name_block)
+
         out.seek(data_start)
 
         with safe_open(safetensors_path, framework='pt', device='cpu') as f:

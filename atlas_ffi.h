@@ -78,6 +78,17 @@ ATLAS_API void atlas_get_info(void* model, int* n_layers, int* hidden_dim,
                               int* inter_dim, int* n_heads, int* n_kv_heads,
                               int* head_dim, int* vocab_size);
 
+// ─── Tensor name API (v4+, no safetensors dependency) ─────────────────
+// Get number of tensors in the model. Returns 0 if names not loaded (v3).
+ATLAS_API int atlas_get_tensor_count(void* model);
+
+// Get tensor name at index. Returns chars written (excluding \0). 0 if error.
+// buf_size should be at least 256.
+ATLAS_API int atlas_get_tensor_name(void* model, int idx, char* buf, int buf_size);
+
+// Find tensor index by exact name match. Returns -1 if not found.
+ATLAS_API int atlas_get_tensor_index(void* model, const char* name);
+
 // ─── Decompression + cache ────────────────────────────────────────────
 // Decompress all TQ1 tensors (ttype==0) to int8 (ttype==3) in-place.
 // Frees packed TQ1 data after decompression. Call once after safetensors loaded.
@@ -94,6 +105,10 @@ ATLAS_API int atlas_load_cache(void* model, const char* atlas_path);
 // Prefetch all int8 data into physical RAM. Touches one byte per 4KB page.
 // Call after decompress or cache load to prevent pagefault stalls.
 ATLAS_API void atlas_prefetch_int8(void* model);
+
+// Set full-precision matmul mode (no activation quantization).
+// Enable for small models (1B) where u8 quantization degrades coherence.
+ATLAS_API void atlas_set_use_f32_matmul(void* model, int val);
 
 // ─── Tensor access ────────────────────────────────────────────────────
 // Get tensor metadata: type, row_dim, col_dim (=packed_cols*5 for TQ1, 0 otherwise).

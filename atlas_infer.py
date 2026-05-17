@@ -62,6 +62,9 @@ dll.atlas_prefetch_int8.argtypes = [ctypes.c_void_p]
 dll.atlas_quantize_lmhead.restype = None
 dll.atlas_quantize_lmhead.argtypes = [ctypes.c_void_p, ctypes.c_int]
 
+dll.atlas_set_use_f32_matmul.restype = None
+dll.atlas_set_use_f32_matmul.argtypes = [ctypes.c_void_p, ctypes.c_int]
+
 dll.atlas_lmhead_gemv.restype = None
 dll.atlas_lmhead_gemv.argtypes = [
     ctypes.c_void_p,
@@ -89,6 +92,14 @@ dll.atlas_get_int8.argtypes = [ctypes.c_void_p, ctypes.c_int,
     ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
     ctypes.POINTER(ctypes.c_float),
     ctypes.POINTER(ctypes.POINTER(ctypes.c_int32))]
+
+dll.atlas_get_tensor_count.restype = ctypes.c_int
+dll.atlas_get_tensor_count.argtypes = [ctypes.c_void_p]
+dll.atlas_get_tensor_name.restype = ctypes.c_int
+dll.atlas_get_tensor_name.argtypes = [ctypes.c_void_p, ctypes.c_int,
+    ctypes.c_char_p, ctypes.c_int]
+dll.atlas_get_tensor_index.restype = ctypes.c_int
+dll.atlas_get_tensor_index.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
 
 dll.atlas_rmsnorm_f32.restype = None
 dll.atlas_rmsnorm_f32.argtypes = [ctypes.POINTER(ctypes.c_float),
@@ -120,8 +131,9 @@ dll.atlas_attention_f32.argtypes = [
 
 # ─── Model class ─────────────────────────────────────────────────────────
 class AtlasModel:
-    def __init__(self, atlas_path, safetensors_path):
+    def __init__(self, atlas_path, safetensors_path=None, model_dir=None):
         self._safe_path = safetensors_path
+        self._model_dir = model_dir
         self._atlas_path = atlas_path
         self.model_ptr = dll.atlas_load(atlas_path.encode())
         if not self.model_ptr:
@@ -137,9 +149,20 @@ class AtlasModel:
         self.vocab_size = vs.value
         self.rope_theta = self._get_rope_theta()
 
-        # Build tensor name→index map from safetensors
-        with safe_open(safetensors_path, framework='np', device='cpu') as f:
-            self.tensor_names = list(f.keys())
+        # Get tensor names from C++ (v4+), fallback to safetensors for v3
+        n = dll.atlas_get_tensor_count(self.model_ptr)
+        if n > 0:
+            self.tensor_names = []
+            buf = ctypes.create_string_buffer(256)
+            for i in range(n):
+                dll.atlas_get_tensor_name(self.model_ptr, i, buf, 256)
+                self.tensor_names.append(buf.value.decode())
+        elif safetensors_path:
+            # v3 fallback: read from safetensors
+            with safe_open(safetensors_path, framework='np', device='cpu') as f:
+                self.tensor_names = list(f.keys())
+        else:
+            raise RuntimeError("Model has no embedded names and no safetensors file provided")
         self.n_tensors = len(self.tensor_names)
 
         print(f"[Atlas] {self.n_layers}L {self.hidden}H {self.inter}I "
@@ -159,6 +182,11 @@ class AtlasModel:
             dll.atlas_save_cache(self.model_ptr, self._atlas_path.encode())
         # Prefetch int8 data into physical RAM (page-in mmap or fresh decompress)
         dll.atlas_prefetch_int8(self.model_ptr)
+
+        # Enable full-precision matmul for small models (1B) where u8 quantization
+        # degrades output coherence. Larger models (3B+) are robust to the noise.
+        if self.hidden <= 2048:
+            dll.atlas_set_use_f32_matmul(self.model_ptr, 1)
 
         # Precompute KV cache
         self.max_seq_len = 4096  # conservative for 16GB
@@ -470,8 +498,11 @@ class AtlasModel:
     def generate(self, prompt, max_new_tokens=50, temperature=1.0,
                  top_k=40, top_p=0.9):
         try:
+            model_dir = getattr(self, '_model_dir', None)
+            if not model_dir:
+                model_dir = os.path.dirname(self._safe_path) if self._safe_path else '.'
             tok = AutoTokenizer.from_pretrained(
-                os.path.dirname(self._safe_path),
+                model_dir,
                 local_files_only=True)
         except:
             return "[TOKENIZER ERROR]"
