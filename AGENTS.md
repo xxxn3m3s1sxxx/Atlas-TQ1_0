@@ -19,10 +19,10 @@
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
 | **Falcon3-1B** | 18 | 2048 × 8192 | 8 / 4 | 1.21 GB | 26.7 tok/s | 8.9 tok/s | 3.5 ms | **1.9 GB** |
 | **Falcon3-3B** | 22 | 3072 × 9216 | 12 / 4 | 1.95 GB | 10.7 tok/s | 4.6 tok/s | 5.4 ms | **4.7 GB** |
-| **Falcon3-7B** | 28 | 3072 × 23040 | 12 / 4 | 2.74 GB | - | - | 13.7 ms* | **8.9 GB** |
-| **Falcon3-10B** | 40 | 3072 × 23040 | 12 / 4 | 3.27 GB | **7.8 tok/s** | **1.9 tok/s** | 16.0 ms | **10.8 GB** |
+| **Falcon3-7B** | 28 | 3072 × 23040 | 12 / 4 | 2.74 GB | **5.2 tok/s*** | **3.2 tok/s*** | **10.5 ms** | **8.3 GB** |
+| **Falcon3-10B** | 40 | 3072 × 23040 | 12 / 4 | 3.27 GB | **7.8 tok/s** | **2.1 tok/s** | 11.4 ms | **10.8 GB** |
 
-> 💡 **Benchmark-Notiz (v1.0.4):** Die Werte wurden nach der Integration des spezialisierten Int8-GEMV-Kernels für den `lm_head` neu vermessen. Der Prefill-Speed des 10B-Modells klettert von 4.5 auf **7.8 tok/s** (+73%), während der Decode-Schnitt im echten Fused-Flugmodus die **1.9 tok/s** Marke durchbricht. Modelle 1B und 7B waren für den Re-Benchmark temporär nicht verfügbar.
+> 💡 **Benchmark-Notiz (v1.0.6):** Die Werte wurden nach der Integration des spezialisierten Int8-GEMV-Kernels, der Fused-Gate/Up-FFN Pipeline und der SiLU+MUL+Quantize Fusion neu vermessen. Das 7B-Modell läuft jetzt mit **3.2 tok/s** Decode bei **8.3 GB RAM** und ist damit vollständig auf 16 GB Systemen nutzbar. Der 10B Decode klettert von 1.7 auf **2.1 tok/s** (+24%). Modelle 1B und 7B waren für den v1.0.4 Re-Benchmark temporär nicht verfügbar.
 
 - **Int8 mmap cache (Bug 8: cache corruption)**: Five root causes fixed:
   1. `atlas_save_cache`: seek-back pattern (`FSEEK`→`fwrite` offset→`FSEEK` data) produced duplicate offsets. Fixed: precompute all offsets via `std::vector<int64_t>`, write once.
@@ -33,7 +33,7 @@
 - **Cache performance**: 3B load 11.1s→3.5s (3×), 10B load 35.9s→15.3s (2.3×). 10B cache: 8.86 GB.
 - **fp16 lm_head RAM fix**: lm_head weight kept as fp16 (768 MB), lazily converted to fp32 on first access. `matmul_f16` uses fast full-size matmul (not chunked) for lm_head; saves 768 MB persistent RAM vs always-fp32. Fixes 10B OOM during warmup.
 
-All with `head_dim=256`, `rope_theta=1000042`, `vocab_size=131072`, GQA architecture.
+All with `head_dim=256`, `rope_theta=1000042`, GQA architecture. 1B/3B/10B use `vocab_size=131072`, 7B uses `131080`.
 
 - **C++ layer loop fusion** (`atlas_forward`): all N layers run in one C call, eliminating Python loop. Ping-pong buffers (`hidden_states` ↔ `buf_out`) avoid per-layer copies. Dedicated `buf_out` prevents conflict with `buf_hidden` scratch. 10B prefill: 4.5→6.2 tok/s (+38%).
 - **All 7 critical bugs fixed** (fseek overflow, Base-3 decode, row stride, K/V swap, RMSNorm truncation, snap buffer overflow, TQ1 padding overflow). All four models verified corr > 0.99 end-to-end.
@@ -108,7 +108,8 @@ Der `lm_head` Matmul-Block (Vokabular-Projektion) wurde vollständig aus der Pyt
 * No file format change — fully backward compatible.
 
 ### Blocked
-- **7B model**: safetensors not present on this machine. Only GGUF variant exists.
+- **WSL performance**: ~4–5× slower than native Windows. Needs native Linux hardware for proper bench.
+- **8 GB RAM limit**: 10B (10.8 GB) does not fit on 8 GB machines. 7B (8.3 GB) may fit with tuned KV cache size.
 
 ## Key Decisions
 - **TQ1 decompressed to int8 at C++ load time**: 126-280 tensors decoded once, packed data freed. Fast `maddubs` SIMD.
