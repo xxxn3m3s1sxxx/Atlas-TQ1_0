@@ -37,6 +37,8 @@
 All with `head_dim=256`, `rope_theta=1000042`, GQA architecture. 1B/3B/10B use `vocab_size=131072`, 7B uses `131080`.
 
 - **C++ layer loop fusion** (`atlas_forward`): all N layers run in one C call, eliminating Python loop. Ping-pong buffers (`hidden_states` ↔ `buf_out`) avoid per-layer copies. Dedicated `buf_out` prevents conflict with `buf_hidden` scratch. 10B prefill: 4.5→6.2 tok/s (+38%).
+
+- **C++ layer loop fusion** (`atlas_forward`): all N layers run in one C call, eliminating Python loop. Ping-pong buffers (`hidden_states` ↔ `buf_out`) avoid per-layer copies. Dedicated `buf_out` prevents conflict with `buf_hidden` scratch. 10B prefill: 4.5→6.2 tok/s (+38%).
 - **All 7 critical bugs fixed** (fseek overflow, Base-3 decode, row stride, K/V swap, RMSNorm truncation, snap buffer overflow, TQ1 padding overflow). All four models verified corr > 0.99 end-to-end.
 - **VirtualAlloc fix**: CRT `new`/`delete` returns freed pages only on memory pressure, not to OS. VirtualAlloc/VirtualFree releases 3.35 GB packed data immediately after decompress. Prefill: 10.8→2.97s.
 - **fp16 embed cache**: embed weight kept as fp16 (1.6 GB), converted on lookup. Saves 1.6 GB RAM.
@@ -46,6 +48,7 @@ All with `head_dim=256`, `rope_theta=1000042`, GQA architecture. 1B/3B/10B use `
 - **v1.0.1 sterilization**: snap_* debug buffers removed, `atlas_forward_layer` (dead since fusion) removed, `atlas_find_tensor` removed. Clean `AtlasModelConfig` struct + `atlas_get_config()` for FFI consumers.
 - **v1.0.1 new in cache**: int8 mmap cache (`.i8` companion file) — saves decompression on subsequent loads. 3B load 11.1s→3.5s, 10B load 35.9s→15.3s. 64KB chunked fwrite avoids short writes on large tensors.
 - **v1.0.1 new in memory**: lazy fp32 lm_head conversion (chunked → full matmul for 10B). RAM peak during warmup ~14.8 GB (10B) includes temp fp32 copy of lm_head (1.5 GB transient). After warmup, persistent RAM ~11.9 GB. 3B peak ~6.5 GB, persistent ~4.7 GB.
+- **v1.0.7 mmap + OMP prefetch**: atlas file mmap eliminates all fread for tensor data. OMP parallel prefetch touches 9.5 GB int8 pages across 8 cores. 10B cached load: 15.3s→**3.3s** (4.6×), 7B: 8.1s→**5.5s** (1.5×).
 
 ### v1.0.2
 - **Bug 9: ping-pong buffer off-by-one** (`atlas_forward`): `forward_layer` (internal per-layer helper with `n_layers=1`, odd) returned the input unchanged. Fused `forward` with all layers (even count) was always correct. Root cause: after the buf_a↔buf_b swap in the loop, the last `forward_layer_internal` output was in `buf_a` for odd counts, but code copied `buf_b` (the input). Fixed: copy from `buf_a` for odd `n_layers`.
@@ -108,6 +111,12 @@ Der `lm_head` Matmul-Block (Vokabular-Projektion) wurde vollständig aus der Pyt
 * **Coherence verified**: 3B `"Hello! How can I assist you today?"`, 10B `'Paris'`.
 * No file format change — fully backward compatible.
 
+### v1.0.7 (current) — Atlas file mmap + OMP parallel prefetch
+* Atlas file mmap'd at load — tensor data points directly into OS-backed pages (zero-copy, demand-paged). Eliminates all fseek/fread for 2.7-3.3 GB atlas files.
+* OMP parallel prefetch: single-threaded page-touch loop parallelized across 8 cores. 9.5 GB int8 .i8 cache faulted in via `#pragma omp parallel for`.
+* lm_head quantize reads fp16 from mmap — skips atlas_vfree for mmap'd data.
+* **Load improvements**: 10B 15.3s→**3.3s** (4.6×), 7B 8.1s→**5.5s** (1.5×).
+
 ### Blocked
 - **WSL performance**: ~4–5× slower than native Windows. Needs native Linux hardware for proper bench.
 - **8 GB RAM limit**: 10B (10.8 GB) does not fit on 8 GB machines. 7B (8.3 GB) may fit with tuned KV cache size.
@@ -132,10 +141,10 @@ Der `lm_head` Matmul-Block (Vokabular-Projektion) wurde vollständig aus der Pyt
 ## Relevant Files
 - `atlas_packer.py`: Packer — streams safetensors → TQ1 ATLAS file.
 - `atlas_infer.py`: Python inference engine — forward + generate.
-- `atlas_api.cpp`: C-exported DLL — load, decompress, `atlas_forward` (fused layers), int8 matmul, fused attention, norms, RoPE.
+- `atlas_api.cpp`: C-exported DLL — load, decompress, `atlas_forward` (fused layers), int8 matmul, fused attention, norms, RoPE, mmap cache, int8 lm_head quantization + GEMV, OMP parallel prefetch.
 - `atlas.dll`: Prebuilt DLL with OpenMP (107 KB) + `libomp.dll` (968 KB).
 - `libatlas.so`: Prebuilt shared library for Linux (39 KB).
-- `compile.bat`: DLL build script (`clang++ -fopenmp -O2 -mavx2 -mfma`).
+- `compile.bat`: DLL build script (`clang++ -fopenmp -O2 -mavx2 -mfma -mf16c -ffast-math`).
 - `compile-linux.sh`: SO build script (`g++ -fopenmp -O2 -mavx2 -mfma -fPIC`).
 - `bench_atlas.py`: Benchmark — load time, per-layer profile, prefill + decode.
 - `C:\atlas\falcon3-{1b,3b,7b,10b}-tq1*.atlas`: Packed model files.
