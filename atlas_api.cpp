@@ -104,9 +104,20 @@ static float xoshiro_float() {
 
 // ─── Gumbel-max sample internal (used by both atlas_sample and atlas_generate) ──
 // Modifies logits in-place as scratch. Returns sampled token ID.
+// When temperature <= 0: deterministic argmax (greedy).
 static int gumbel_sample(float* logits, int V,
                           float temperature, int top_k, float top_p) {
-    if (temperature > 0.0f && temperature != 1.0f) {
+    // Temperature ≤ 0: deterministic greedy argmax
+    if (temperature <= 0.0f) {
+        int best = 0;
+        float best_val = logits[0];
+        for (int i = 1; i < V; i++) {
+            if (logits[i] > best_val) { best_val = logits[i]; best = i; }
+        }
+        return best;
+    }
+
+    if (temperature != 1.0f) {
         float invT = 1.0f / temperature;
         for (int i = 0; i < V; i++) logits[i] *= invT;
     }
@@ -1914,14 +1925,11 @@ ATLAS_API int atlas_generate(AtlasModel* m,
                   k_cache, v_cache, max_seq_len, n_input,
                   layer_idx, m->n_layers);
 
-    // Final RMSNorm + LM head on all prompt tokens
-    // (extract last token's result for first decode step)
-    for (int i = 0; i < n_input; i++) {
-        const float* x = embed_buf + (int64_t)i * H;
+    // Final RMSNorm + LM head — only the last prompt token's logits are needed
+    {
+        const float* x = embed_buf + (int64_t)(n_input - 1) * H;
         atlas_rmsnorm_f32(x, norm_w, h_norm, H, 1e-6f);
         atlas_lmhead_gemv(m, h_norm, logits, 1);
-        // Only keep result for the last prompt token
-        if (i == n_input - 1) break;
     }
 
     // Sample first token from prefill logits

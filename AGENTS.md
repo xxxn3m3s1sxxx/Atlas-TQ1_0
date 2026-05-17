@@ -48,9 +48,9 @@
 4. **README finalisieren** mit v1.1.0 (v5 format, embedded tokenizer, engine hardening).
 
 ## Critical Context
-- **v1.1.0 latest release** (Production Hardening + v5 embedded tokenizer).
-- **All 4 models in v5 format**: 1.22 GB (1B), 1.96 GB (3B), 2.75 GB (7B), 3.28 GB (10B).
-- **`.i8` cache**: ~1.1 GB (1B) to ~9.5 GB (10B). Auto-generated on first load, mmap'd on subsequent loads.
+- **v1.2.0-pre latest** (C++ Sampling + generate, Bug 11 fixed).
+- **10B model only** on disk (1B/3B/7B removed to free space for 10B testing).
+- **`.i8` cache**: Auto-generated on first load, mmap'd on subsequent loads.
 - **Prefill is already batched**: `forward()` passes all prompt tokens as B=prompt_len in single `atlas_forward` call. `atlas_attention_f32` handles causal masking per-token within the batch.
 - **Engine correctness**: corr=0.9967 with fixed Python reference. Remaining 0.3% = shared quantization gap.
 - **1B f32 bypass**: Auto-enabled for `hidden <= 2048`. Confirms u8 path is exact (identical argmax).
@@ -62,10 +62,9 @@
 - **Memory**: Loading via file mmap (zero-copy). `AtlasModel(model)` = ~200 MB Python + ~1-10 GB C++ (OS-paged from mmap).
 
 ## Relevant Files
-- `C:\atlas\atlas_api.cpp`: `atlas_get_tokenizer()` C API (line 441), v5 header parsing (bytes 29-36), AllocHdr valloc/vfree, is_mapped guards, int8 matmul kernel, f32 bypass.
-- `C:\atlas\atlas_infer.py`: `AtlasModel` — embedded tokenizer loading via `atlas_get_tokenizer()`, `generate()` uses `PreTrainedTokenizerFast` with embedded data, no `model_dir` required for v5.
-- `C:\atlas\atlas_ffi.h`: Updated with `atlas_get_tokenizer` declaration and v5 header layout docs.
+- `C:\atlas\atlas_api.cpp`: `atlas_get_tokenizer()` C API (line 441), v5 header parsing (bytes 29-36), AllocHdr valloc/vfree, is_mapped guards, int8 matmul kernel, f32 bypass, Xoshiro256** PRNG, Gumbel-max sample, `atlas_generate()`.
+- `C:\atlas\atlas_infer.py`: `AtlasModel` — embedded tokenizer loading via `atlas_get_tokenizer()`, `generate_c()` wraps `atlas_generate` (v1.2.0).
+- `C:\atlas\atlas_ffi.h`: Full C API — v5 layout, `atlas_get_tokenizer`, `atlas_set_seed`, `atlas_sample`, `atlas_generate`.
 - `C:\atlas\atlas_packer.py`: v5 format writer — appends tokenizer block after tensor data, stores offset in header.
-- `C:\atlas\atlas_kernel.hpp`: Legacy TQ1 gather kernel — not in inference path.
-- `C:\atlas\falcon3-{1b,3b,7b,10b}-tq1.atlas`: **v5** packed model files with embedded tokenizer.
-- `C:\models\Falcon3-{1B,3B,7B,10B}-Instruct-1.58bit\`: model config, optional safetensors (only needed for repacking).
+- `C:\atlas\falcon3-10b-tq1.atlas`: **v5** packed 10B model file with embedded tokenizer.
+- `C:\models\Falcon3-10B-Instruct-1.58bit\`: model config, optional safetensors (only needed for repacking).
