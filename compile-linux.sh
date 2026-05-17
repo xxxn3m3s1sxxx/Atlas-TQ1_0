@@ -1,6 +1,8 @@
 #!/bin/bash
 # Compile libatlas.so for Linux x86-64 (AVX2 + FMA)
-set -euo pipefail
+# Requires: g++ with OpenMP support
+# Usage: ./compile-linux.sh [CXX] [CXXFLAGS]
+set -eu
 SRC="atlas_api.cpp"
 OUT="libatlas.so"
 CXX="${CXX:-g++}"
