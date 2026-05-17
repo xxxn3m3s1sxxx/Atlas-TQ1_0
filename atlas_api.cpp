@@ -1156,22 +1156,33 @@ static void forward_layer_internal(
         }
     }
 
-    // ─── 8. SiLU(gate) * up ───
-    silu_inplace(m->buf_gate, B * inter);
-    for (int i = 0; i < B * inter; i++) {
-        m->buf_hidden[i] = m->buf_gate[i] * m->buf_up[i];
-    }
-
-    // ─── 9. Down projection (int8) ───
+    // ─── 8. Fused SiLU(gate)*up + quantize → down matmul ───
+    // Fused: read gate+up once → SiLU+mul → pad → quantize → buf_i8.
+    // Eliminates: separate silu_inplace (buffered write), mul→buf_hidden, memcpy→buf_act.
     {
         auto& td = m->tensors[idx_down];
         int8_t* w; int32_t* rs; int rows, dim; float scale;
         get_i8(td, w, rs, rows, dim, scale);
         for (int b = 0; b < B; b++) {
-            memcpy(m->buf_act + b * dim, m->buf_hidden + b * inter, inter * sizeof(float));
-            memset(m->buf_act + b * dim + inter, 0, (dim - inter) * sizeof(float));
+            const float* g = m->buf_gate + b * inter;
+            const float* u = m->buf_up + b * inter;
+            float* tmp = m->buf_act + b * dim;
+            float mb = 1e-5f;
+            for (int i = 0; i < inter; i++) {
+                float v = (g[i] / (1.0f + expf(-g[i]))) * u[i];
+                tmp[i] = v;
+                float av = fabsf(v);
+                if (av > mb) mb = av;
+            }
+            for (int i = inter; i < dim; i++) tmp[i] = 0.0f;
+            float inv = 127.0f / mb;
+            max_abs[b] = mb;
+            for (int i = 0; i < dim; i++) {
+                int q = (int)(tmp[i] * inv + 128.5f);
+                if (q < 0) q = 0; if (q > 255) q = 255;
+                m->buf_i8[b * dim + i] = (uint8_t)q;
+            }
         }
-        quantize_f32_to_u8(m->buf_act, B, dim, max_abs, m->buf_i8);
         matmul_reorder_deq(rows, dim, w, rs, m->buf_i8, max_abs,
                           scale, m->buf_hidden, m->buf_gate, B);
     }
