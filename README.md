@@ -27,6 +27,13 @@ All use `head_dim=256`, `rope_theta=1000042`, `vocab_size=131072`, GQA architect
 
 1B and 3B models fit comfortably in **8 GB RAM** (see Memory table). The 3B offers the best quality-to-speed ratio for memory-constrained systems.
 
+## 🚀 Key Features (v1.2.0-pre)
+
+* **Native C++ Autoregressive Loop (`atlas_generate`):** Zero Python context-switching overhead during token generation.
+* **Xoshiro256\*\* PRNG:** Embedded pseudo-random number generator for blazing-fast, register-level sampling.
+* **Gumbel-Max Top-K / Top-P Sampling:** Mathematically hardened to eliminate low-bit repetition loops and degenerate states.
+* **Zero-Copy Memory Mapping:** Matrix cache scales instantly via native OS memory maps.
+
 ## Quick Start
 
 ### Requirements
@@ -130,10 +137,14 @@ safetensors ──► atlas_packer.py ──► .atlas file ──► atlas_infe
 
 Tested on a legacy **Intel Core i7-7700T** (4 Cores / 8 Threads @ 2.9 GHz, 35W TDP, Kaby Lake) under Windows 11 (UCRT / MinGW LLVM toolchain):
 
-| Model Architecture | Cold Load | Warm Load (mmap) | Generation Speed | Output Quality |
-| :--- | :--- | :--- | :--- | :--- |
-| **Falcon3-7B-Instruct** | 94s | ~15s | **1.3 tokens/sec** | ✅ Coherent ("Paris") |
-| **Falcon3-10B-Instruct** | 383s | ~35s | **1.1 tokens/sec** | ✅ Full context stability |
+| Model Architecture | Layers | Cold Load | Warm Load (mmap) | Generation Speed | Output Quality |
+| :--- | :---: | :---: | :---: | :---: | :--- |
+| **Falcon3-1B-Instruct** | 18 | 13.6s | ~2s | **6.5 tokens/sec** | ✅ Coherent (f32-bypass) |
+| **Falcon3-3B-Instruct** | 22 | 35.9s | ~5s | **4.8 tokens/sec** | ✅ Sweet spot (8 GB RAM) |
+| **Falcon3-7B-Instruct** | 28 | 94.0s | ~15s | **1.3 tokens/sec** | ✅ Coherent ("Paris") |
+| **Falcon3-10B-Instruct** | 40 | 383.0s | ~35s | **1.1 tokens/sec** | ✅ Full context stability |
+
+⚠️ **CRITICAL: Dual-Channel RAM Required.** Low-bit CPU inference is memory-bandwidth bound. Single-Channel RAM halves throughput — expect 40-50% lower tok/s.
 
 *Note: Models utilize the native `.i8` memory-mapped binary cache. Subsequent loads are near-instantaneous via zero-copy mmap.*
 
