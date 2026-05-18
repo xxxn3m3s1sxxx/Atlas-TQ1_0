@@ -6,6 +6,10 @@
 
 ATLAS is a CPU-based inference engine for BitNet b1.58 ternary-quantized language models. It repacks HuggingFace safetensors into the **TQ1.0** format (5 ternary trits packed per byte, Base-3 encoded) and runs fast inference through a hybrid C++ library + Python pipeline. No GPU required. Runs on an i5 laptop with 16 GB RAM. **Windows + Linux x86-64.**
 
+> ⚡ **Architecture Scope:** ATLAS v1.2.0 is a hyper-optimized, dependency-free inference engine specifically tailored for **Falcon3 Ternary (1.58-bit) architectures** using an interleaved RoPE pattern and a fused SwiGLU loop.
+>
+> *Multi-architecture support (Half-Split RoPE for Llama3-1.58bit and Sub-Norm topologies for BitNet-2B) is currently cataloged for the v1.3/v1.4 development cycles.*
+
 ## Motivation
 
 BitNet b1.58 models replace full-precision weights with ternary values (-1, 0, +1), reducing memory by 16-32x versus FP16. However, existing inference frameworks target CUDA GPUs, leaving CPU users unable to run these models. ATLAS fills this gap: it packs ternary weights into a compact TQ1 format and uses int8 AVX2 matmuls on CPU to achieve usable decode speeds on commodity hardware.
@@ -86,6 +90,16 @@ OpenMP is enabled by default. On Windows, `libomp.dll` must be discoverable at r
 
 **Windows-specific**: The MKL backend that numpy may use loads `libiomp5md.dll`, a different OpenMP runtime. This causes `OMP: Error #15` at import time. `atlas_infer.py` sets `KMP_DUPLICATE_LIB_OK=TRUE` automatically to suppress this. If you see the error despite this, set `KMP_DUPLICATE_LIB_OK=TRUE` in your environment before running.
 
+### 🛠️ Windows Runtime Troubleshooting
+
+If you compile using the LLVM-MinGW toolchain and encounter a `FileNotFoundError` or activation error when loading `atlas.dll` via ctypes, ensure the following MinGW runtime DLLs are placed in your working directory (next to `atlas.dll`):
+- `libunwind.dll`
+- `libwinpthread-1.dll`
+- `libc++.dll`
+- `libomp.dll` (OpenMP parallelization backend)
+
+These are shipped with the LLVM-MinGW distribution under `x86_64-w64-mingw32\bin\`. Copy them next to `atlas.dll` or add that directory to your `PATH`.
+
 ## Architecture
 
 ```
@@ -111,6 +125,17 @@ safetensors ──► atlas_packer.py ──► .atlas file ──► atlas_infe
 4. **Int8 matmul kernel** (`atlas_matmul_i8_f32`): Uses `_mm256_maddubs_epi16` AVX2 dot-product with a +128 offset trick. Weights are stored as signed int8 (decompressed from TQ1 at load). Activations are quantized per-token to uint8 with max-abs scaling. Output rows are deinterleaved from the BitNet 4-row-packed layout back to natural order. OpenMP parallelizes over rows.
 
 5. **Python inference** (`atlas_infer.py`): Coordinates loading, tokenization, and the autoregressive loop. All transformer layers are fused into a single `atlas_forward` C++ call per forward pass. Only the final RMSNorm, LM head matmul (numpy), and sampling remain in Python. Platform-aware: loads `atlas.dll` on Windows, `libatlas.so` on Linux.
+
+### 📊 Hardware Validation (The 35W Office Benchmark)
+
+Tested on a legacy **Intel Core i7-7700T** (4 Cores / 8 Threads @ 2.9 GHz, 35W TDP, Kaby Lake) under Windows 11 (UCRT / MinGW LLVM toolchain):
+
+| Model Architecture | Cold Load | Warm Load (mmap) | Generation Speed | Output Quality |
+| :--- | :--- | :--- | :--- | :--- |
+| **Falcon3-7B-Instruct** | 94s | ~15s | **1.3 tokens/sec** | ✅ Coherent ("Paris") |
+| **Falcon3-10B-Instruct** | 383s | ~35s | **1.1 tokens/sec** | ✅ Full context stability |
+
+*Note: Models utilize the native `.i8` memory-mapped binary cache. Subsequent loads are near-instantaneous via zero-copy mmap.*
 
 ## Performance
 
