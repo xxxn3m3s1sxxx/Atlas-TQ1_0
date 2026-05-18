@@ -137,12 +137,14 @@ safetensors ──► atlas_packer.py ──► .atlas file ──► atlas_infe
 
 Tested on a legacy **Intel Core i7-7700T** (4 Cores / 8 Threads @ 2.9 GHz, 35W TDP, Kaby Lake) under Windows 11 (UCRT / MinGW LLVM toolchain):
 
-| Model Architecture | Layers | Cold Load | Warm Load (mmap) | Generation Speed | Output Quality |
+| Model Architecture | Layers | Cold Load | Steady State (Warm) | Generation Speed | Output Quality |
 | :--- | :---: | :---: | :---: | :---: | :--- |
-| **Falcon3-1B-Instruct** | 18 | 13.6s | ~2s | **6.5 tokens/sec** | ✅ Coherent (f32-bypass) |
-| **Falcon3-3B-Instruct** | 22 | 35.9s | ~5s | **4.8 tokens/sec** | ✅ Sweet spot (8 GB RAM) |
-| **Falcon3-7B-Instruct** | 28 | 94.0s | ~15s | **1.3 tokens/sec** | ✅ Coherent ("Paris") |
-| **Falcon3-10B-Instruct** | 40 | 383.0s | ~35s | **1.1 tokens/sec** | ✅ Full context stability |
+| **Falcon3-1B-Instruct** | 18 | 13.6s | ~2s | **8.79 tokens/sec** | ✅ Coherent (f32-bypass) |
+| **Falcon3-3B-Instruct** | 22 | 35.9s | ~5s | **4.25 tokens/sec** | ✅ Sweet spot (8 GB RAM) |
+| **Falcon3-7B-Instruct** | 28 | 94.0s | ~15s | **2.13 tokens/sec** | ✅ Coherent output |
+| **Falcon3-10B-Instruct** | 40 | 383.0s | ~20s | **1.70 tokens/sec** | ✅ Stable output |
+
+*Note on 10B Execution:* The very first execution after cold launch exhibits a significant page-fault penalty (~200s) on the i7-7700T storage subsystem while memory-mapping and pre-pinning the layers. Subsequent execution cycles completely bypass this overhead, reaching a stable steady-state of ~1.70 tok/s.
 
 ⚠️ **CRITICAL: Dual-Channel RAM Required.** Low-bit CPU inference is memory-bandwidth bound. Single-Channel RAM halves throughput — expect 40-50% lower tok/s.
 
