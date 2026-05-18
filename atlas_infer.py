@@ -677,24 +677,21 @@ class AtlasModel:
 
 
 if __name__ == '__main__':
-    if len(sys.argv) < 3:
-        print("Usage: python atlas_infer.py <atlas.tq1> <model_dir> [prompt]")
-        print("  atlas.tq1  — path to packed .atlas file")
-        print("  model_dir  — directory containing model.safetensors + config.json + tokenizer")
+    if len(sys.argv) < 2:
+        print("Usage: python atlas_infer.py <atlas.tq1> [prompt]")
+        print("  atlas.tq1  — path to packed .atlas file (v5, embedded tokenizer)")
         print("  prompt     — optional prompt (default: 'Say hello')")
         sys.exit(1)
     atlas_path = sys.argv[1]
-    model_dir = sys.argv[2]
-    safe_path = os.path.join(model_dir, "model.safetensors")
-    prompt = sys.argv[3] if len(sys.argv) > 3 else "Say hello"
+    prompt = sys.argv[2] if len(sys.argv) > 2 else "Say hello"
 
     print(f"[Atlas] Loading {atlas_path}...")
     t0 = time.time()
-    model = AtlasModel(atlas_path, safe_path)
+    model = AtlasModel(atlas_path)
     print(f"[Atlas] Loaded in {time.time() - t0:.1f}s")
 
     print(f"[Atlas] Generating: {prompt}")
     t0 = time.time()
-    text = model.generate(prompt, max_new_tokens=20, temperature=0.0)
+    text = model.generate_c(prompt, max_new_tokens=20, temperature=0.0)
     print(f"[Atlas] Output: {text}")
     print(f"[Atlas] Time: {time.time() - t0:.1f}s")

@@ -6,7 +6,7 @@
 
 ATLAS is a CPU-based inference engine for BitNet b1.58 ternary-quantized language models. It repacks HuggingFace safetensors into the **TQ1.0** format (5 ternary trits packed per byte, Base-3 encoded) and runs fast inference through a hybrid C++ library + Python pipeline. No GPU required. Runs on an i5 laptop with 16 GB RAM. **Windows + Linux x86-64.**
 
-> ⚡ **Architecture Scope:** ATLAS v1.2.0 is a hyper-optimized, dependency-free inference engine specifically tailored for **Falcon3 Ternary (1.58-bit) architectures** using an interleaved RoPE pattern and a fused SwiGLU loop.
+> ⚡ **Architecture Scope:** ATLAS v1.2.1 is a hyper-optimized, dependency-free inference engine specifically tailored for **Falcon3 Ternary (1.58-bit) architectures** using an interleaved RoPE pattern and a fused SwiGLU loop.
 >
 > *Multi-architecture support (Half-Split RoPE for Llama3-1.58bit and Sub-Norm topologies for BitNet-2B) is currently cataloged for the v1.3/v1.4 development cycles.*
 
@@ -27,12 +27,13 @@ All use `head_dim=256`, `rope_theta=1000042`, `vocab_size=131072`, GQA architect
 
 1B and 3B models fit comfortably in **8 GB RAM** (see Memory table). The 3B offers the best quality-to-speed ratio for memory-constrained systems.
 
-## 🚀 Key Features (v1.2.0-pre)
+## 🚀 Key Features (v1.2.1)
 
-* **Native C++ Autoregressive Loop (`atlas_generate`):** Zero Python context-switching overhead during token generation.
+* **Native C++ Autoregressive Loop (`atlas_generate`):** Single FFI call for the entire decode loop — embed lookup, RMSNorm, LM head GEMV, and Gumbel-max sampling all in C++. No Python round-trips between tokens.
 * **Xoshiro256\*\* PRNG:** Embedded pseudo-random number generator for blazing-fast, register-level sampling.
-* **Gumbel-Max Top-K / Top-P Sampling:** Mathematically hardened to eliminate low-bit repetition loops and degenerate states.
-* **Zero-Copy Memory Mapping:** Matrix cache scales instantly via native OS memory maps.
+* **Gumbel-Max Top-K / Top-P Sampling:** Mathematically hardened to eliminate low-bit repetition loops and degenerate states. T=0 bypasses to direct argmax for deterministic output.
+* **`AtlasModel.set_seed()`:** Seed the C++ PRNG from Python for reproducible sampling.
+* **Zero-Copy Memory Mapping:** Int8 weight cache scales instantly via native OS mmap.
 
 ## Quick Start
 
@@ -52,7 +53,7 @@ pip install numpy safetensors transformers
 ### 1. Pack safetensors into ATLAS format
 
 ```bash
-python atlas_packer.py path/to/model.safetensors falcon3-10b-tq1_0.atlas
+python atlas_packer.py path/to/model.safetensors falcon3-10b-tq1.atlas
 ```
 
 The packer reads the safetensors file, de-interleaves BitNet's 4-row-packed uint8 format, repacks each weight row into TQ1 Base-3 bytes, and writes an ATLAS file with a 64-byte header, 12-byte-per-tensor directory, and tensor data blobs. The model directory (containing `config.json` and tokenizer) is inferred from the safetensors path.
@@ -64,10 +65,14 @@ Pre-built atlas files are named `falcon3-{size}b-tq1.atlas`.
 ```python
 from atlas_infer import AtlasModel
 model = AtlasModel('falcon3-1b-tq1.atlas')
-print(model.generate("What is the capital of France?"))
+print(model.generate_c("What is the capital of France?", temperature=0.0))  # greedy
+
+# Deterministic sampling with explicit seed
+model.set_seed(42)
+print(model.generate_c("What is the capital of France?", temperature=0.7, top_k=40, top_p=0.9))
 ```
 
-The inference script loads the atlas file into the C++ DLL, initializes the tokenizer from the embedded v5 data, and runs autoregressive generation with GQA attention, RoPE, KV cache, SiLU FFN, and temperature sampling. No `model_dir` required — the `.atlas` file is fully self-contained.
+The inference script loads the atlas file into the C++ DLL, initializes the tokenizer from the embedded v5 data, and runs autoregressive generation. `generate_c()` calls `atlas_generate` — a single C++ function that handles the entire decode loop: embedding lookup, fused forward through all layers, LM head GEMV, and sampling (Gumbel-max at T>0, direct argmax at T=0). No `model_dir` required — the `.atlas` file is fully self-contained.
 
 ### 3. Compile the C++ library (if modifying code)
 
@@ -131,7 +136,7 @@ safetensors ──► atlas_packer.py ──► .atlas file ──► atlas_infe
 
 4. **Int8 matmul kernel** (`atlas_matmul_i8_f32`): Uses `_mm256_maddubs_epi16` AVX2 dot-product with a +128 offset trick. Weights are stored as signed int8 (decompressed from TQ1 at load). Activations are quantized per-token to uint8 with max-abs scaling. Output rows are deinterleaved from the BitNet 4-row-packed layout back to natural order. OpenMP parallelizes over rows.
 
-5. **Python inference** (`atlas_infer.py`): Coordinates loading, tokenization, and the autoregressive loop. All transformer layers are fused into a single `atlas_forward` C++ call per forward pass. Only the final RMSNorm, LM head matmul (numpy), and sampling remain in Python. Platform-aware: loads `atlas.dll` on Windows, `libatlas.so` on Linux.
+5. **Python inference + C++ generation** (`atlas_infer.py`): Coordinates loading and tokenization. Generation uses `atlas_generate` — a single C++ call that runs the entire decode loop: embedding lookup, fused `atlas_forward` through all layers, final RMSNorm, LM head int8 GEMV, and Gumbel-max sampling (argmax at T=0). No Python code runs between tokens. Platform-aware: loads `atlas.dll` on Windows, `libatlas.so` on Linux.
 
 ### 📊 Hardware Validation (The 35W Office Benchmark)
 
@@ -161,13 +166,13 @@ All models use the fused `atlas_forward` (all layers in one C++ call). Per-layer
 | Falcon3-1B (18L, 2048×8192)  | n/a | **9.4 tok/s** | 3.5 ms | 4.5s | 0.8s | 1.9 GB |
 | Falcon3-3B (22L, 3072×9216)  | 10.7 tok/s | **5.0 tok/s** | 5.4 ms | 10.1s | 1.4s | 4.7 GB |
 | Falcon3-7B (28L, 3072×23040) | 3.3 tok/s | **3.2 tok/s** | 10.5 ms | ~7s | ~7s | 8.3 GB |
-| Falcon3-10B (40L, 3072×23040) | 7.8 tok/s | **2.1 tok/s** | 11.4 ms | ~? | ~? | 10.8 GB |
+| Falcon3-10B (40L, 3072×23040) | 7.8 tok/s | **1.4 tok/s** | 11.4 ms | 7.5s | 7.5s | 10.8 GB |
 
 All models verified with coherence test: "The capital of France is Paris." (3B/7B/10B). 1B requires sampling (greedy degenerates to `,` due to model distribution, not engine). All models run under 16 GB RAM; 1B and 3B fit comfortably in **8 GB RAM**. The engine is deterministic and exact at full precision via the f32 matmul bypass path — identical argmax to the u8-quantized path.
 
 ### Per-Model Breakdown
 
-**Falcon3-10B**: Flagship model (40 layers, 3072×23040). Fused gate+up OMP matmul and fused SiLU+mul+quantize eliminate intermediate buffers in every FFN block. 2.1 tok/s decode at 10.8 GB RAM. Per-layer 11.4 ms — 26% faster than v1.0.4 (15.3 ms → 11.4 ms).
+**Falcon3-10B**: Flagship model (40 layers, 3072×23040). Fused gate+up OMP matmul and fused SiLU+mul+quantize eliminate intermediate buffers in every FFN block. 1.4 tok/s decode via `atlas_generate` at 10.8 GB RAM. Per-layer 11.4 ms — 26% faster than v1.0.4 (15.3 ms → 11.4 ms).
 
 **Falcon3-7B**: Identical architecture to 10B with 28 layers instead of 40 (30% fewer).
 Most impactful for throughput: 3.2 tok/s decode at only 8.3 GB RAM — runs on 8-12 GB systems with KV cache tuning. Per-layer 10.5 ms (slightly faster than 10B due to less cache pressure with fewer layers).
