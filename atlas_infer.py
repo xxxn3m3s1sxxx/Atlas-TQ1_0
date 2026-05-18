@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Atlas Inference Engine — End-to-end Falcon3-7B TQ1.0 generation."""
+"""Atlas Inference Engine v1.2.1 — End-to-end Falcon3 TQ1.0 generation."""
 import ctypes, struct, os, sys, time, numpy as np
 from safetensors import safe_open
 from transformers import AutoTokenizer
@@ -249,6 +249,10 @@ class AtlasModel:
             except Exception as e:
                 print(f"[Atlas] Tokenizer load failed: {e}")
 
+
+    def set_seed(self, seed):
+        """Set C++ PRNG seed for deterministic sampling."""
+        dll.atlas_set_seed(ctypes.c_uint64(seed))
 
     def _cache_indices(self):
         self.idx = {}
@@ -608,7 +612,7 @@ class AtlasModel:
 
     def generate_c(self, prompt, max_new_tokens=50, temperature=1.0,
                    top_k=40, top_p=0.9):
-        """Generate via atlas_generate (single C call, v1.2.0)."""
+        """Generate via atlas_generate (single C call, v1.2.1)."""
         try:
             if self._tok is not None:
                 from transformers import PreTrainedTokenizerFast

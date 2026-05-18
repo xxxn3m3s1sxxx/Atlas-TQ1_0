@@ -152,7 +152,7 @@ Tested on a legacy **Intel Core i7-7700T** (4 Cores / 8 Threads @ 2.9 GHz, 35W T
 
 ## Performance
 
-Measured on i5-1235U (Alder Lake, 2P+8E, 8 OMP threads, AVX2+FMA, 16 GB DDR4) with v1.1.0 (mmap + OMP prefetch + f32 matmul bypass for 1B + v5 embedded tokenizer).
+Measured on i5-1235U (Alder Lake, 2P+8E, 8 OMP threads, AVX2+FMA, 16 GB DDR4) with v1.2.1 (C++ sampling + fused generate + mmap + OMP prefetch + f32 matmul bypass + v5 embedded tokenizer).
 
 All models use the fused `atlas_forward` (all layers in one C++ call). Per-layer C++ times include RMSNorm + 7× int8 matmul (Q/K/V/O/gate/up/down) + fused GQA attention + Fused FFN (gate+up in one OMP region, SiLU+mul+quantize). The `atlas_forward` call runs all N layers as a single C function with ping-pong buffers — no Python round-trips between layers.
 
